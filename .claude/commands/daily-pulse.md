@@ -119,7 +119,7 @@ For each cluster (existing or new):
 A cluster's Status is derived, not stored independently. Run these checks in order:
 
 1. **Has 0 currently-active symptoms AND its prior Status was already RESOLVED** → stay `RESOLVED`. Skip the rest.
-2. **Has 0 currently-active symptoms AND prior Status was active** → increment the consecutive-inactive counter in Notes. If consecutive-inactive >= 3, flip to `RESOLVED`. Otherwise keep prior Status — it's just "quiet this run."
+2. **Has 0 currently-active symptoms AND prior Status was active** → increment the consecutive-inactive counter in Notes. Flip to `RESOLVED` only when BOTH hold: (a) at least **7 consecutive inactive daily-pulse runs** (≈7 days, since this runs daily), AND (b) at least 7 days since the most recent activity date recorded in Notes history. We don't expect every cluster to fire every day, so 3 quiet runs alone isn't enough signal. Otherwise keep prior Status — it's just "quiet this run."
 3. **Has >=1 currently-active symptom AND prior Status was RESOLVED** → regression. Flip back to whatever the max-severity rule says. Note in Notes: "regressed after N runs RESOLVED."
 4. **Has >=1 currently-active symptom (normal case)** → Status = max severity across underlying symptoms. `HIGH ALERT` > `OPEN` > `MONITORING`. Reset consecutive-inactive counter to 0.
 
@@ -472,6 +472,7 @@ Call RS-DB MCP `send_email` with `to`, `subject`, HTML body. If the call fails, 
 - **Don't touch `cs-*` rows.** Those belong to customer-watch.
 - **Don't touch `cw-*` rows.** Those belong to conversation-watch. This skill only reads them.
 - **Run date must be the exact UTC time of writeback**, to the second. Never round.
+- **Every RESOLVED write requires a rationale in Notes** — trigger rule, last-active date, days inactive, customer count at last activity. Example: `RESOLVED — 8 consecutive inactive runs (8 days), last active 2026-05-07 with 3 customers.` If you can't construct one (e.g. inactive <7 days, last-active date unknown), do NOT flip to RESOLVED — keep prior Status.
 
 # Chat report-back
 

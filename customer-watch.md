@@ -203,7 +203,7 @@ When a MONITORING issue is sighted on this run and Streak >= 3 (so this is the 3
 
 **Auto-dismissal: MONITORING → RESOLVED**
 
-When a MONITORING issue has been clean for 3 consecutive runs without further sightings, flip Status to `RESOLVED` with Notes "dismissed before escalation — false alarm or one-off." It disappears from email like any other RESOLVED row.
+A MONITORING issue may auto-dismiss to RESOLVED only when BOTH hold: (a) at least **7 days since first sighting** (use Notion `Created time`), AND (b) no sightings in that 7+ day window. If the row is less than 7 days old, leave it MONITORING regardless of how many clean runs have stacked — we don't expect issues to fire every run, so 3 clean runs alone isn't enough signal. Every RESOLVED write must include a rationale — see Hard rules.
 
 **Manual operator action:**
 
@@ -463,6 +463,7 @@ If a writeback call fails, retry once. If still failing, include the failed payl
 - No emojis.
 - Watched-customer list is source of truth. Don't expand or shrink it based on today's signal.
 - The skill reports. It does not propose, recommend, suggest, prioritize, file, or escalate.
+- **Every RESOLVED write requires a rationale in Notes** — trigger rule, first-sighted date, last-sighted date, days clean. Example: `RESOLVED — MONITORING auto-dismissal. First sighted 2026-05-01, last sighted 2026-05-02, 13 days clean.` If you can't construct one (e.g. row <7 days old, last-sighted unknown), do NOT flip to RESOLVED — leave the row in its current status.
 
 # Chat report-back
 

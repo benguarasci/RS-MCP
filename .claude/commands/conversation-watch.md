@@ -173,9 +173,7 @@ For each issue row touched this run, apply the standard transitions:
 
 ## MONITORING auto-dismissal
 
-If a MONITORING row has not been sighted for **3 consecutive conversation-watch runs**, flip to RESOLVED with Notes "dismissed before escalation — no further sightings."
-
-Track this via a "clean runs since last sighting" counter in Notes (e.g. `"sighting 2, 1 clean since"`).
+A MONITORING row may auto-dismiss to RESOLVED only when BOTH hold: (a) at least **7 days since first sighting** (use Notion `Created time`), AND (b) no sightings in that 7+ day window. Track in Notes: `"first sighted 2026-05-08; 4 clean runs since"`. If the row is less than 7 days old, leave it MONITORING regardless of clean-run count. Every RESOLVED write must include a rationale — see Hard rules.
 
 # Step 6 — Notion writeback
 
@@ -238,6 +236,7 @@ Next run reads `cw-heartbeat`'s Run date as the window start. This is the only s
 - Never propose fixes, file tickets, recommend Linear actions. This skill records observations. Higher layers (daily-pulse, health-check) do analysis.
 - Status writes must use exact Select values: `OPEN`, `MONITORING`, `RESOLVED`, `HIGH ALERT`, `NON ISSUE`. Any other value is a bug — skip the write and surface in report-back.
 - **Never write to `cs-` rows.** Those belong to customer-watch. This skill writes only `cw-`-prefixed rows and the `cw-heartbeat` singleton.
+- **Every RESOLVED write requires a rationale in Notes** — trigger rule, first-sighted date, last-sighted date, days clean. Example: `RESOLVED — MONITORING auto-dismissal. First sighted 2026-05-01, last sighted 2026-05-02, 13 days clean.` If you can't construct one (e.g. row <7 days old, last-sighted unknown), do NOT flip to RESOLVED — leave the row in its current status.
 
 # Chat report-back
 
