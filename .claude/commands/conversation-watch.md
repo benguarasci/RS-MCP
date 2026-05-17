@@ -24,57 +24,49 @@ This skill **never sends email**. No Gmail, no RS-DB send_email. If you find you
 # Configuration
 
 - **Scope**: first arg, optional. If provided, restrict to those company IDs. If empty, process all companies. Operator uses scoping for testing; production runs are unscoped.
-- **Time window**: from the most recent prior conversation-watch run's `Run date` (stored on the singleton heartbeat row, see Step 7) up to now. If no prior run, default to last 4 hours.
+- **Time window**: from the most recent prior conversation-watch run's `Run date` (the `Run date` property on the `cw-state` record — see Step 6) up to now. If `cw-state` doesn't exist yet, default to the last 4 hours.
 
 # Namespace
 
-This skill writes rows with the `cw-` prefix exclusively. customer-watch owns the `cs-` prefix. **The two namespaces never overlap.** Rows are also tagged `Issue Type = System` vs `Issue Type = Customer`, but the name prefix is the primary separator — if you ever find yourself about to write a `cs-` row from this skill, stop.
+This skill maintains exactly one Notion record: `cw-state` (`Issue Type = System`). Every symptom it tracks lives as a section inside that record's body — it never writes per-issue rows. customer-watch owns the separate `cs-` namespace; daily-pulse owns `cl-state`. **Never read or write `cs-` rows, and never touch `cl-state`.** If you find yourself about to create any row other than `cw-state`, stop.
 
-# Step 1 — Read Notion known issues
+# Step 1 — Read the cw-state record
 
-The view query returns every row in the database. Filter to `cw-`-prefixed rows only. **Never read, update, or even include `cs-`-prefixed rows in the map.** Those belong to customer-watch.
+This skill maintains a single consolidated record, `cw-state`, in the `Self learning db` data source. Its body holds every tracked symptom as a `### cw-{customer}-{symptom}` section under `## Active issues` / `## Resolved issues`. The old per-issue-row format is retired — there is no per-row map to build.
 
-## 1a. Query the lookup view
+## 1a. Locate cw-state
 
 Call `notion-query-database-view`:
 
 - `view_url: https://www.notion.so/rentsimple/35f9fe3faf4280c69197f5c4d390650a?v=35f9fe3faf4280328b21000c3d59b65d`
 
-This is the **`system-watch-lookup`** view — pre-filtered to `Issue Type = System`, sorted by `Last edited time` desc. **Do not use the `customer-watch-lookup` view** (`?v=3609fe3faf428049bc99000cd69e28a3`) — that one filters to `Issue Type = Customer` and will return zero `cw-` rows, making this skill think every pattern is brand new on every run.
+This is the **`system-watch-lookup`** view — pre-filtered to `Issue Type = System`. **Do not use the `customer-watch-lookup` view** (`?v=3609fe3faf428049bc99000cd69e28a3`) — that one filters to `Issue Type = Customer` and will not return `cw-state`. Iterate pagination until exhausted, then pick the single row with Name exactly `cw-state`.
 
-Iterate pagination until exhausted.
+- If `cw-state` exists, that's your record.
+- If `cw-state` does not exist (first ever run), there are no known issues yet — you'll create the record in Step 6.
+- Ignore every other row: `cl-state` belongs to daily-pulse, `cs-*` rows belong to customer-watch, and any legacy per-issue `cw-*` rows are retired. Never read or write them.
 
-## 1b. Build the page_id map
+## 1b. Fetch and parse the body
 
-For each row, exact-Name match against:
+`notion-fetch` the `cw-state` page. From its body, read every `### cw-{customer}-{symptom}` section under `## Active issues` and `## Resolved issues`. Each section carries: Status, Streak, Clean runs since last sighting, Customer, Last sighted, Sample convs, Detection signal, Issue, and Notes.
 
-- `cw-{slug}-{issue-slug}` → per-issue row
+This parsed set is your **known-issues map** for the rest of the run, keyed by the exact `cw-{customer}-{symptom}` slug. The `Detection signal` field on each section is what you evaluate new conversations against.
 
-Ignore every row whose Name does not match this pattern exactly. Specifically drop:
+## 1c. Drop NON ISSUE
 
-- Any `cs-*` row (customer-watch's namespace)
-- The `cw-heartbeat` singleton (not a per-issue row)
-- Any malformed name
-
-Build: `issues → {company-slug → {exact_name → {page_id, properties, body, detection_signal}}}`
-
-For each canonical per-issue row, `notion-fetch` the body to extract its `Detection signal`.
-
-## 1c. Deduplicate and drop NON ISSUE
-
-Most recent by `Run date` wins on duplicates. Drop NON ISSUE Names entirely.
+Skip any section whose Status is `NON ISSUE` — never re-flag or resurrect it.
 
 ## 1d. Hard precondition
 
-Before any writeback: the map must exist. If the view query failed, abort writeback and surface the failure. Do not "best-effort create" anything.
+Before any writeback the known-issues map must be in hand. If the view query failed, abort the writeback and surface the failure. Do not "best-effort create" a fresh `cw-state` — that would clobber existing history.
 
 # Step 2 — Determine the window
 
-Window start = the most recent `Run date` on the **heartbeat row** (Name = `cw-heartbeat`, a singleton row that tracks just this skill's last run). Window end = now. If no heartbeat exists yet, default to 4 hours back.
+Window start = the `Run date` property on the `cw-state` record (the timestamp of this skill's previous run). Window end = now. If `cw-state` doesn't exist yet, default to 4 hours back.
 
 **Strict rules** (same as customer-watch):
 
-- Use ONLY `Run date`. Never `Last edited time`, `Created time`, or any other timestamp.
+- Use ONLY `cw-state`'s `Run date` property. Never `Last edited time`, `Created time`, or any other timestamp.
 - Treat date-only values as midnight UTC.
 - When writing Run date, always write as a datetime (ISO with time component, `2026-05-14T22:00:00.000Z`).
 
@@ -144,26 +136,26 @@ This is the same criteria as customer-watch Step 4 — examples of "obviously wr
 - Conversation had a wrong-bedroom / wrong-property reminder
 - Backend threading bug — multiple prospects merged in one thread
 
-**Single instance is enough.** One flagged conversation creates or updates a MONITORING issue row.
+**Single instance is enough.** One flagged conversation creates or updates a MONITORING issue section in `cw-state`.
 
 For each flagged conversation, decide:
 
 1. **Does it match a known issue's detection signal for this customer?**
-   - If yes: append the conv ID to the existing per-issue row's Sample Convs (replace, keep most recent 3). Increment Streak (sighting count for MONITORING; reset to 0 for OPEN/HIGH ALERT since signal fired).
+   - If yes: append the conv ID to that issue section's Sample convs (replace, keep most recent 3). Increment Streak (sighting count for MONITORING; reset to 0 for OPEN/HIGH ALERT since signal fired).
 2. **Is it a new pattern?**
    - Form a kebab-case slug describing the failure
    - Note 1+ example conv IDs
-   - Mark for creation as new MONITORING row in Step 7
+   - Mark for addition as a new MONITORING section in Step 6
 
 ## Avoid double-flagging the same conversation
 
 Track which conv IDs you process this run. If the same conversation matches two known issues, that's fine — append to both. But never write the same conv ID twice into the same row's Sample Convs.
 
-If a conv ID already appears in the row's existing Sample Convs from a prior run, don't increment Streak — that conversation has already been counted.
+If a conv ID already appears in the issue section's existing Sample convs from a prior run, don't increment Streak — that conversation has already been counted.
 
 # Step 5 — Status transitions (same as customer-watch Step 3)
 
-For each issue row touched this run, apply the standard transitions:
+For each issue touched this run, apply the standard transitions:
 
 - **MONITORING** (Streak = sighting count). Sighted this run → Streak += 1. At Streak >= 3 → flip to OPEN, reset Streak to 0. Not sighted → no change.
 - **OPEN** (Streak = clean-run count). Sighted this run → Streak = 0. Not sighted → Streak += 1. At Streak >= 30 with no firing this run → flip to RESOLVED.
@@ -173,59 +165,71 @@ For each issue row touched this run, apply the standard transitions:
 
 ## MONITORING auto-dismissal
 
-A MONITORING row may auto-dismiss to RESOLVED only when BOTH hold: (a) at least **7 days since first sighting** (use Notion `Created time`), AND (b) no sightings in that 7+ day window. Track in Notes: `"first sighted 2026-05-08; 4 clean runs since"`. If the row is less than 7 days old, leave it MONITORING regardless of clean-run count. Every RESOLVED write must include a rationale — see Hard rules.
+A MONITORING issue may auto-dismiss to RESOLVED only when BOTH hold: (a) at least **7 days since first sighting** (use the first-sighted date recorded in the issue section's Notes), AND (b) no sightings in that 7+ day window. Track in the section's Notes: `"first sighted 2026-05-08; 4 clean runs since"`. If the issue was first sighted less than 7 days ago, leave it MONITORING regardless of clean-run count. Every RESOLVED write must include a rationale — see Hard rules.
 
 # Step 6 — Notion writeback
 
-For each issue row to write:
+This skill writes exactly one record: `cw-state`. You rewrite its whole body each run — assemble the full new body in memory, then write it once.
 
-1. Look up page_id by exact Name in Step 1 map.
-2. **If page_id exists:** `notion-update-page` `update_properties` with new Status, Run date (now, ISO with time), Sample Convs, Streak, Notes. Body untouched.
-3. **If no page_id** (new pattern): `notion-create-pages` with parent `{"type": "data_source_id", "data_source_id": "35f9fe3f-af42-80ba-bf81-000b602adf12"}` and the new-issue body template.
-
-**Hard rules against duplicates:**
-
-- Never `notion-create-pages` for a Name in the Step 1 map.
-- Never `notion-create-pages` because a search "didn't return" something — only because the map genuinely has no entry.
-- Name string must match `cw-{company-slug}-{issue-slug}` exactly. No suffixes, no `cs-` prefix ever.
-
-## Heartbeat row
-
-After processing, upsert a singleton row with Name `cw-heartbeat`:
-
-- **Name** (title): `cw-heartbeat`
-- **Status** (select): `OPEN` (just for schema validity — semantically meaningless on this row)
-- **Run date** (datetime): **the exact UTC time the writeback finishes**, ISO with time component to the second (e.g. `2026-05-15T01:43:08.000Z`). **Do not round to the nearest hour or midnight** — the next run uses this as its window start, so rounding gives the wrong window. If you don't know "now" precisely, query the DB with `SELECT NOW()`.
-- **Companies count** (number): number of companies with conversations processed this run
-- **Notes** (text): one short line, e.g. "Run 14 — processed 87 conversations across 12 companies; 3 new MONITORING flags."
-
-Next run reads `cw-heartbeat`'s Run date as the window start. This is the only state this skill maintains across runs.
-
-## New per-issue body template
+## Assemble the new cw-state body
 
 ```markdown
-**Issue:** <one sentence — what's going wrong from customer's perspective>
+- **Last run:** <ISO datetime this writeback finishes>
+- **Window this run:** <window_start> → <now>
+- **Run count:** <prior run count + 1>
+- **Last run summary:** <one line — conversations processed, companies touched, new flags>
 
-**Detection signal:** <mechanical — describe the pattern in terms of message content (what the AI said, what the prospect said), property/building involvement, error codes, or state metrics. NEVER reference Conversation.summary. Future runs evaluate this against message content.>
+## Active issues
 
-**Recovery criteria:** <when can we mark RESOLVED — auto-resolution handles standard cases at 30 clean runs, but document any custom recovery here>
+### cw-{customer}-{issue}
+- **Status:** MONITORING | OPEN | HIGH ALERT
+- **Streak:** <number>
+- **Clean runs since last sighting:** <number>
+- **Customer:** <customer name>
+- **Last sighted:** <ISO datetime of most recent sighting>
+- **Sample convs:** <up to 3 conversation IDs, most recent>
+- **Detection signal:** <mechanical pattern — see below>
+- **Issue:** <one sentence — what's wrong from the customer's perspective>
+- **Notes:** <one short line — sighting / clean-run state, plus the first-sighted date>
 
-**Examples on first detection:**
+## Resolved issues
 
-- {conv_id} — {one-line context}
+### cw-{customer}-{issue}
+- (same fields; Notes carries the RESOLVED rationale)
 ```
 
-## Properties for per-issue rows
+Rules for assembling it:
 
-- **Run date** (datetime): now
-- **Companies** (text): customer name
-- **Companies count** (number): 1
+- **Carry forward every existing section unchanged** except the ones touched this run. A `replace_content` that drops untouched issues loses history — assemble from the full parsed map (Step 1), not just this run's changes.
+- For an existing issue sighted or transitioned this run: update its Status, Streak, Clean runs since last sighting, Last sighted, Sample convs, and Notes. **Detection signal and Issue stay stable** — never rewrite them once set.
+- For a new pattern found this run: add a new `### cw-{customer}-{issue}` section under `## Active issues`, Status `MONITORING`, with the full field set.
+- **Slugs are stable forever.** A `### cw-{customer}-{issue}` heading never changes once created — that's how history is preserved across runs.
+- When an issue flips to `RESOLVED`, move its section under `## Resolved issues`. If a RESOLVED issue regresses (its signal fires again), move it back under `## Active issues`.
+- Skip `NON ISSUE` sections — leave them as they are; never re-flag them.
+
+**Detection signal** must be mechanical: describe the pattern in terms of message content (what the AI said, what the prospect said), property/building involvement, error codes, or state metrics. NEVER reference `Conversation.summary`. Future runs evaluate this field against message content.
+
+## Write cw-state back
+
+- **If `cw-state` exists** (found in Step 1): `notion-update-page` with `command: replace_content`, passing the full new body as `new_str`; then `update_properties` for the page-level properties below.
+- **If `cw-state` does not exist** (first ever run): `notion-create-pages` with parent `{"type": "data_source_id", "data_source_id": "35f9fe3f-af42-80ba-bf81-000b602adf12"}`, the assembled body as `content`, and the properties below.
+
+Page-level properties on `cw-state`:
+
+- **Name** (title): `cw-state` — never changes
 - **Issue Type** (select): `System` (the actual Notion field name is `Issue Type`, not `Type`)
-- **Name** (title): `cw-{company-slug}-{issue-slug}`, stable across runs
-- **Status** (select): from Step 5 transitions
-- **Sample Convs** (text): up to 3 conv IDs from this run if signal fired; preserved across runs if not
-- **Streak** (number): per Step 5
-- **Notes** (text): one short line — e.g. `"fired: 2 examples this run"`, `"MONITORING: sighting 2, 1 clean since"`, `"OPEN: clean run 12/30"`
+- **Status** (select): `OPEN` — an operational marker only; semantically meaningless on this record (per-issue status lives in the body)
+- **Companies count** (number): number of companies with conversations processed this run
+- **Run date** (datetime): **the exact UTC time the writeback finishes**, ISO with time component to the second (e.g. `2026-05-15T01:43:08.000Z`). **Do not round to the nearest hour or midnight** — the next run uses this as its window start, so rounding gives the wrong window. If you don't know "now" precisely, query the DB with `SELECT NOW()`.
+- **Notes** (text): one short line, e.g. `Run 14 — processed 87 conversations across 12 companies; 3 new MONITORING flags.`
+
+`cw-state` is the only state this skill maintains across runs; the next run reads its `Run date` as the window start. There is no separate `cw-heartbeat` row — that singleton is retired; `cw-state` absorbs its role.
+
+**Hard rules against clobbering:**
+
+- Never `notion-create-pages` when `cw-state` already exists — that creates a duplicate. Update the existing record in place.
+- Never write a second `cw-state`, never write per-issue `cw-*` rows, never write `cl-state` or `cs-*` rows.
+- Every `### cw-{customer}-{issue}` slug must match that pattern exactly. No suffixes, no `cs-` prefix ever.
 
 # Hard rules
 
@@ -235,8 +239,8 @@ Next run reads `cw-heartbeat`'s Run date as the window start. This is the only s
 - No emojis.
 - Never propose fixes, file tickets, recommend Linear actions. This skill records observations. Higher layers (daily-pulse, health-check) do analysis.
 - Status writes must use exact Select values: `OPEN`, `MONITORING`, `RESOLVED`, `HIGH ALERT`, `NON ISSUE`. Any other value is a bug — skip the write and surface in report-back.
-- **Never write to `cs-` rows.** Those belong to customer-watch. This skill writes only `cw-`-prefixed rows and the `cw-heartbeat` singleton.
-- **Every RESOLVED write requires a rationale in Notes** — trigger rule, first-sighted date, last-sighted date, days clean. Example: `RESOLVED — MONITORING auto-dismissal. First sighted 2026-05-01, last sighted 2026-05-02, 13 days clean.` If you can't construct one (e.g. row <7 days old, last-sighted unknown), do NOT flip to RESOLVED — leave the row in its current status.
+- **Never write `cs-` rows or `cl-state`.** Those belong to customer-watch and daily-pulse. This skill writes only the `cw-state` record.
+- **Every RESOLVED write requires a rationale in the issue section's Notes** — trigger rule, first-sighted date, last-sighted date, days clean. Example: `RESOLVED — MONITORING auto-dismissal. First sighted 2026-05-01, last sighted 2026-05-02, 13 days clean.` If you can't construct one (e.g. issue first sighted <7 days ago, last-sighted unknown), do NOT flip to RESOLVED — leave the issue in its current status.
 
 # Chat report-back
 

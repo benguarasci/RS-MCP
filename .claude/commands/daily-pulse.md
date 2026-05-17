@@ -3,15 +3,15 @@ description: Daily issue-cluster tracker. Reads per-customer symptom flags from 
 argument-hint: optional comma-separated email recipients (else uses $HEALTH_CHECK_RECIPIENTS or asks)
 ---
 
-You're the daily issue-tracker. conversation-watch (Layer 0) flags per-customer symptoms in Notion. Your job each run: read those symptom flags, group them into clusters where **one fix would close all symptoms in the cluster**, update the persistent cluster records in Notion (so they accumulate history across runs), and email a status view of every active cluster — current state, with each entry annotated by what's happened to it over time.
+You're the daily issue-tracker. conversation-watch (Layer 0) flags per-customer symptoms into a single `cw-state` record in Notion. Your job each run: read those symptom flags, group them into clusters where **one fix would close all symptoms in the cluster**, update the consolidated `cl-state` record in Notion (so clusters accumulate history across runs), and email a status view of every active cluster — current state, with each entry annotated by what's happened to it over time.
 
 This is a status view with memory, not a diff. Every active cluster appears in the brief. Each cluster line carries its own history inline so the reader can scan and see what's new, what's growing, what's shrinking, what's steady, and what's been resolved since the last run.
 
 # When to use this
 
-- **conversation-watch** (Layer 0) — runs every 2-4 hours, reads every prospect conversation, writes per-customer `cw-` symptom rows to Notion.
-- **daily-pulse** (this one) — runs daily, reads the active `cw-` rows, groups them into `cl-` cluster rows in Notion, emails a status view with history.
-- **health-check** (Layer 2) — runs weekly, reads the same cluster history plus the underlying symptom rows, writes a longer-form trend email.
+- **conversation-watch** (Layer 0) — runs every 2-4 hours, reads every prospect conversation, writes per-customer symptoms into a single `cw-state` record in Notion.
+- **daily-pulse** (this one) — runs daily, reads conversation-watch's `cw-state` record, groups its symptoms into clusters held in a single `cl-state` record in Notion, emails a status view with history.
+- **health-check** (Layer 2) — runs weekly, reads the same `cl-state` cluster history plus the underlying `cw-state` symptoms, writes a longer-form trend email.
 - **customer-watch** — a separate, manually-curated watch over named at-risk customers. Lives in the `cs-` namespace. Don't touch its rows.
 
 # Required MCP tools
@@ -26,40 +26,46 @@ This skill **never touches Postgres**. No conversation reading, no DB queries. N
 # Configuration
 
 - **Email recipients**: `$ARGUMENTS` if provided, else env var `$HEALTH_CHECK_RECIPIENTS`, else ask once.
-- **Scope**: every `cw-` symptom row with Status in `MONITORING`, `OPEN`, or `HIGH ALERT`. Anything in `NON ISSUE` or `RESOLVED` is excluded from current clustering, though `RESOLVED` rows from the last 7 days are still useful for showing recently-closed work in the brief.
+- **Scope**: every symptom in `cw-state` with Status in `MONITORING`, `OPEN`, or `HIGH ALERT`. Anything in `NON ISSUE` or `RESOLVED` is excluded from current clustering, though symptoms resolved within the last 7 days are still useful for showing recently-closed work in the brief.
 
 # Step 1 — Read the Notion data
 
-## 1a. Query the system-watch view
+This skill reads two consolidated records, both in the `Self learning db` data source:
+
+- **`cw-state`** — conversation-watch's single record. Its body lists every per-customer symptom under `## Active issues` / `## Resolved issues`, each as a `### cw-{customer}-{symptom}` section. This is the input.
+- **`cl-state`** — this skill's own single record. Its body holds every cluster under `## Active clusters` / `## Resolved clusters`, each as a `### cl-{slug}` section with rolling history. This is the state you maintain.
+
+The per-row format (one Notion row per symptom or per cluster) is retired. Everything lives in these two record bodies.
+
+## 1a. Locate the two records
 
 Call `notion-query-database-view`:
 
 - `view_url: https://www.notion.so/rentsimple/35f9fe3faf4280c69197f5c4d390650a?v=35f9fe3faf4280328b21000c3d59b65d`
 
-This is the `system-watch-lookup` view, pre-filtered to `Issue Type = System`. It returns both kinds of rows this skill cares about: per-customer symptoms (`cw-*`) and cluster rows (`cl-*`). Iterate pagination until exhausted.
+This is the `system-watch-lookup` view, pre-filtered to `Issue Type = System`. Iterate pagination until exhausted. From the results, pick out the two rows by exact Name: `cw-state` and `cl-state`.
 
-## 1b. Sort rows into two buckets
+- `cw-state` must exist — it's the input. If it's missing, stop and surface the failure.
+- `cl-state` may not exist on the very first run. If it's missing, you'll create it in Step 3.
+- Ignore every other row. Legacy per-issue `cw-*` rows, legacy per-cluster `cl-*` rows, `cs-*` rows, `cw-heartbeat` — none are read by this skill anymore. Only `cw-state` and `cl-state`.
 
-For each row, decide which bucket it goes in by Name prefix:
+## 1b. Fetch both bodies
 
-- **Symptom rows** — Name starts with `cw-{customer-slug}-{symptom-slug}`. These come from conversation-watch.
-- **Cluster rows** — Name starts with `cl-{cluster-slug}`. These come from prior runs of this skill.
-- **Skip** anything else:
-  - `cs-*` rows belong to customer-watch — not this skill's namespace
-  - `cw-heartbeat` is operational state, not a symptom
-  - Any malformed name
+`notion-fetch` the `cw-state` page, and the `cl-state` page if it exists. All symptom and cluster data lives in the page bodies, not the properties.
 
-Within symptom rows, keep only those with Status `MONITORING`, `OPEN`, or `HIGH ALERT`. Also separately keep symptoms with Status `RESOLVED` AND a `Run date` in the last 7 days — useful for the "Resolved this week" section.
+## 1c. Parse the symptoms from cw-state
 
-Within cluster rows, read all of them, regardless of Status. RESOLVED clusters that regress (a new symptom matches them) need to flip back to active.
+From `cw-state`'s body, read every `### cw-{customer}-{symptom}` section under `## Active issues`. Each section carries Status, Streak, Customer, Last sighted, Sample convs, Detection signal, Issue, and Notes.
 
-## 1c. Fetch bodies where useful
+Keep symptoms whose Status is `MONITORING`, `OPEN`, or `HIGH ALERT` — these are the active symptoms to cluster this run. Separately note symptoms that are `RESOLVED` with a resolution within the last 7 days (under `## Resolved issues`, or in the active section flipped to `RESOLVED`) — useful for the "Resolved" tail and for aging clusters out.
 
-For each cluster row, `notion-fetch` the body to read its current symptom list (the body lists which `cw-` slugs belong to that cluster). For symptom rows, fetch a body only if a row is brand-new this run and you need the detection signal to decide where it clusters.
+## 1d. Parse the clusters from cl-state
 
-## 1d. Hard precondition
+From `cl-state`'s body (if it exists), read every `### cl-{slug}` section under `## Active clusters` and `## Resolved clusters`. Each section carries Status, Streak, Customers, Sample convs, the cluster description (What this cluster is / Why these symptoms group together), its Symptoms list, and its rolling History. Read RESOLVED clusters too — a regression flips them back to active.
 
-If the view query fails, stop. Do not do partial writebacks. If only some pages came back, you cannot trust the cluster mapping and would create duplicates. Surface the failure in chat report-back.
+## 1e. Hard precondition
+
+If the view query fails, or `cw-state` cannot be fetched, stop. Do not do a partial writeback. Surface the failure in the chat report-back.
 
 # Step 2 — Map symptoms to clusters
 
@@ -73,9 +79,9 @@ Examples (illustrative, not prescriptive):
 
 ## 2a. Match against existing clusters first
 
-For each active symptom row, decide if it already belongs to a known cluster:
+For each active symptom, decide if it already belongs to a known cluster:
 
-1. **Slug match** — if the symptom's `cw-{customer}-{symptom-slug}` is already listed in some cluster's body, that's its home. Deterministic, no ambiguity.
+1. **Slug match** — if the symptom's `cw-{customer}-{symptom-slug}` is already listed in some cluster's Symptoms list in `cl-state`, that's its home. Deterministic, no ambiguity.
 2. **Semantic match** — if no slug match, read the cluster's description and check whether the symptom is plausibly fixed by the same change. If yes, assign it. Be conservative: when in doubt, do not force a match — it's better to leave a symptom unclustered for one run than to merge clusters that should stay separate.
 
 ## 2b. Form new clusters from unmatched symptoms
@@ -95,12 +101,12 @@ A good signal that you've over-merged: the cluster spans both voice and text cha
 
 ## 2d. Aggressively minimize — dedupe and consolidate
 
-**Default toward fewer, larger clusters.** Every extra cluster row is more state to read, longer emails, more token cost on every future run. Before finalizing the cluster set, do an explicit dedupe pass:
+**Default toward fewer, larger clusters.** Every extra cluster is more state to read, longer emails, more token cost on every future run. Before finalizing the cluster set, do an explicit dedupe pass:
 
-1. **Symptom-overlap merge.** For any two active clusters whose symptom lists overlap by 50% or more, merge them. Keep the older cluster slug (or the one with the broader fix-scope description); migrate the loser's symptoms into the winner; mark the loser cluster `RESOLVED` with Notes "merged into cl-{winner-slug}". The merge is a one-way operation — the loser stays in Notion as a RESOLVED record but never gets reused.
+1. **Symptom-overlap merge.** For any two active clusters whose symptom lists overlap by 50% or more, merge them. Keep the older cluster slug (or the one with the broader fix-scope description); migrate the loser's symptoms into the winner; move the loser's section under `## Resolved clusters` with Status `RESOLVED` and a History line "merged into cl-{winner-slug}". The merge is one-way — the loser stays as a RESOLVED section but never gets reused.
 2. **Singleton absorption.** A singleton cluster (1 symptom, 1 customer, Streak 1) that plausibly fits an existing active cluster should be absorbed into the existing cluster rather than persisted on its own. Only keep a singleton as its own cluster if it genuinely doesn't fit any existing one — and even then, watch it: if it stays a singleton for 3+ runs with no peers, ask again whether it could be absorbed.
-3. **Stale cluster cleanup.** If a cluster has been `RESOLVED` for 30+ days with no regression, mark its Notes with "archived — safe to delete from view" so an operator can prune by hand. Don't delete from Notion programmatically; the operator owns destructive cleanup.
-4. **Empty clusters.** If a cluster row has 0 active symptoms AND 0 recently-resolved symptoms, it's an orphan. Set it to `RESOLVED` immediately with Notes "orphaned — no active symptoms."
+3. **Stale cluster cleanup.** Drop any `### cl-{slug}` section that has been `RESOLVED` for 30+ days with no regression — remove it from the `## Resolved clusters` section entirely.
+4. **Empty clusters.** If a cluster has 0 active symptoms AND 0 recently-resolved symptoms, it's an orphan. Set it to `RESOLVED` immediately with a History line "orphaned — no active symptoms."
 
 **Bias toward "this is already a cluster" over "this is a new cluster."** The default move when a new symptom appears is to find its home, not to invent a new bucket. New clusters should be the exception.
 
@@ -108,70 +114,87 @@ A good signal that you've over-merged: the cluster spans both voice and text cha
 
 For each cluster (existing or new):
 
-1. Compute its **current symptom list** (the active `cw-` rows that mapped to it this run)
+1. Compute its **current symptom list** (the active symptoms that mapped to it this run)
 2. Compute its **current customer list** (customers with at least one active symptom in the cluster)
 3. Compute its **Status** using the rules below
-4. Compute its **Streak** — consecutive runs the cluster has been Active (had at least one symptom mapped). Track consecutive-inactive runs in Notes between snapshot lines.
-5. Compute the **history annotation** — a short natural-language line describing what changed this run vs prior runs. Pull from the cluster's existing Notes field (which carries the last few snapshots).
+4. Compute its **Streak** — consecutive runs the cluster has been Active (had at least one symptom mapped). Track consecutive-inactive runs in the History field between snapshot lines.
+5. Compute the **history annotation** — a short natural-language line describing what changed this run vs prior runs. Pull from the cluster's existing History field (which carries the last few snapshots).
 
 ## Status rules
 
 A cluster's Status is derived, not stored independently. Run these checks in order:
 
 1. **Has 0 currently-active symptoms AND its prior Status was already RESOLVED** → stay `RESOLVED`. Skip the rest.
-2. **Has 0 currently-active symptoms AND prior Status was active** → increment the consecutive-inactive counter in Notes. Flip to `RESOLVED` only when BOTH hold: (a) at least **7 consecutive inactive daily-pulse runs** (≈7 days, since this runs daily), AND (b) at least 7 days since the most recent activity date recorded in Notes history. We don't expect every cluster to fire every day, so 3 quiet runs alone isn't enough signal. Otherwise keep prior Status — it's just "quiet this run."
+2. **Has 0 currently-active symptoms AND prior Status was active** → increment the consecutive-inactive counter in History. Flip to `RESOLVED` only when BOTH hold: (a) at least **7 consecutive inactive daily-pulse runs** (≈7 days, since this runs daily), AND (b) at least 7 days since the most recent activity date recorded in Notes history. We don't expect every cluster to fire every day, so 3 quiet runs alone isn't enough signal. Otherwise keep prior Status — it's just "quiet this run."
 3. **Has >=1 currently-active symptom AND prior Status was RESOLVED** → regression. Flip back to whatever the max-severity rule says. Note in Notes: "regressed after N runs RESOLVED."
 4. **Has >=1 currently-active symptom (normal case)** → Status = max severity across underlying symptoms. `HIGH ALERT` > `OPEN` > `MONITORING`. Reset consecutive-inactive counter to 0.
 
 ## Aging out
 
-Symptoms can age out underneath a cluster. If an underlying `cw-` row has Status `NON ISSUE` or `RESOLVED` this run, drop it from the cluster's symptom list. Don't drag dead symptoms along forever — they make the cluster look bigger than it is and bloat token usage on every subsequent read.
+Symptoms can age out underneath a cluster. If an underlying symptom has Status `NON ISSUE` or `RESOLVED` this run, drop it from the cluster's symptom list. Don't drag dead symptoms along forever — they make the cluster look bigger than it is and bloat token usage on every subsequent read.
 
 If after dropping all dead symptoms the cluster has 0 active symptoms, fall through to the consecutive-inactive countdown above.
 
-## 3a. Write each cluster's properties
+## 3a. Assemble the new cl-state body
 
-For each cluster, upsert by exact Name:
-
-- If a `cl-{slug}` row exists in Step 1's data, `notion-update-page` it
-- If no `cl-{slug}` row exists, `notion-create-pages` it
-
-Properties to set:
-
-- **Name** (title): `cl-{cluster-slug}` — never change after first creation
-- **Issue Type** (select): `System`
-- **Status** (select): `MONITORING`, `OPEN`, `HIGH ALERT`, or `RESOLVED` per Step 3 step 3
-- **Streak** (number): per Step 3 step 4
-- **Companies** (text): comma-separated current customer names
-- **Companies count** (number): count of current customers
-- **Sample Convs** (text): up to 3 example conversation IDs pulled from the underlying symptom rows
-- **Run date** (datetime): **exact UTC time of this writeback to the second** — same rule as conversation-watch. Do not round.
-- **Notes** (text): rolling history. Each run, prepend a one-line snapshot describing this run's state of the cluster. Cap at the most recent 7 entries to keep the field readable. Example:
-  - `2026-05-15: 6 customers, +Mosaic, streak 3`
-  - `2026-05-14: 5 customers, steady, streak 2`
-  - `2026-05-13: 5 customers, NEW, streak 1`
-
-## 3b. Write the cluster body on creation
-
-On first creation of a cluster row, write a body using this template:
+You're rewriting one record. Build the full `cl-state` body in memory, then write it once. The body mirrors `cw-state`:
 
 ```markdown
-**What this cluster is:** <one sentence — the underlying mechanism, as best you can describe it>
+- **Last run:** <ISO datetime of this run>
+- **Run count:** <prior run count + 1>
+- **Last run summary:** <one line — active cluster count, customers affected, notable changes>
 
-**Why these symptoms group together:** <one sentence — what the shared fix would address>
+## Active clusters
 
-**Symptoms in this cluster:**
+### cl-{slug}
+- **Status:** MONITORING | OPEN | HIGH ALERT
+- **Streak:** <number>
+- **Customers:** Name1, Name2 (<count>)
+- **Sample convs:** <up to 3 conversation IDs>
+- **What this cluster is:** <one stable sentence — the underlying mechanism>
+- **Why these symptoms group together:** <one stable sentence — what the shared fix addresses>
+- **Symptoms:**
+  - cw-{customer}-{symptom}
+  - ...
+- **History:**
+  - YYYY-MM-DD: <snapshot — customer count, change, streak>
+  - ... (newest first, cap at 7 lines)
 
-- cw-{customer1}-{symptom1}
-- cw-{customer2}-{symptom2}
-- ...
+## Resolved clusters
+
+### cl-{slug}
+- (same fields; final History line records the resolution rationale)
 ```
 
-On subsequent runs, **rewrite the Symptoms list** in the body to reflect the current set (symptoms can be added or removed across runs as they newly fire or get resolved). The top two lines stay stable unless the cluster genuinely changes meaning, in which case rewrite carefully.
+Rules for assembling it:
 
-## 3c. Resolved clusters stay in Notion
+- One `### cl-{slug}` section per cluster. Active clusters (`MONITORING`/`OPEN`/`HIGH ALERT`) go under `## Active clusters`; `RESOLVED` clusters under `## Resolved clusters`.
+- **Slug is stable forever.** A `### cl-{slug}` heading never changes once created — that's how history is preserved.
+- **What / Why lines are stable.** Carry them forward verbatim from the prior `cl-state` unless the cluster genuinely changes meaning, in which case rewrite carefully.
+- **Symptoms list** is rewritten every run to the current member set (symptoms get added as they newly fire, dropped as they age out).
+- **History** — prepend one new dated snapshot line each run; keep only the most recent 7. Track the consecutive-inactive counter here too (e.g. `2026-05-20: 0 active symptoms, quiet run 2`).
+- If a cluster has 0 active symptoms but isn't yet flipping to RESOLVED (see Status rules), keep its section under `## Active clusters` with its prior Status and an updated History line.
+- Prune `## Resolved clusters`: drop any section RESOLVED for 30+ days.
 
-When a cluster flips to `RESOLVED`, leave its row in place — don't delete it. It carries the history of the issue. If it regresses (a new symptom fires that maps to it semantically), update the row in place: Status back to active, Streak resets to 1, history note records "regressed after N runs RESOLVED."
+## 3b. Write cl-state back
+
+- **If `cl-state` exists** (found in Step 1): `notion-update-page` with `command: replace_content`, passing the full new body as `new_str`; then `update_properties` to refresh the page-level properties below.
+- **If `cl-state` does not exist** (first run): `notion-create-pages` with parent `{"type": "data_source_id", "data_source_id": "35f9fe3f-af42-80ba-bf81-000b602adf12"}`, the assembled body as `content`, and the properties below.
+
+Page-level properties on `cl-state`:
+
+- **Name** (title): `cl-state` — never changes
+- **Issue Type** (select): `System`
+- **Status** (select): `OPEN` — an operational marker only; semantically meaningless on this record (per-cluster status lives in the body)
+- **Companies count** (number): total distinct customers with at least one active symptom this run
+- **Run date** (datetime): **exact UTC time of this writeback, to the second.** Never round.
+- **Notes** (text): one-line run summary, e.g. `Run 8 — 12 active clusters (1 OPEN, 11 MONITORING) across 9 customers; +1 new, 1 resolved.`
+
+Never create a second `cl-state`. Never write per-cluster `cl-{slug}` rows — the per-row format is retired. All cluster state lives in the `cl-state` body.
+
+## 3c. Resolved clusters stay in the body
+
+When a cluster flips to `RESOLVED`, move its `### cl-{slug}` section under `## Resolved clusters` — don't delete it. It carries the issue's history. If it regresses (a new symptom maps to it semantically), move the section back under `## Active clusters`, Status back to active, Streak resets to 1, and add a History line "regressed after N runs RESOLVED." Drop a RESOLVED section only after 30+ days resolved.
 
 # Step 4 — Compose the email
 
@@ -188,7 +211,7 @@ Examples:
 
 ## Body structure
 
-1. **Topline** — total active clusters, total active symptom rows, total customers affected, any HIGH ALERT items called out
+1. **Topline** — total active clusters, total active symptoms, total customers affected, any HIGH ALERT items called out
 2. **Active clusters** — every cluster with Status `MONITORING`, `OPEN`, or `HIGH ALERT`. Each one shows: name, current customer count, current symptom count, status pill, history annotation (NEW / +X / -Y / steady / growing / shrinking), one-sentence description, list of currently-affected customers.
 3. **Resolved since last run** — any cluster that flipped to `RESOLVED` this run. One line each. Disappears after one appearance.
 4. **Footer** — generation time, source
@@ -439,7 +462,7 @@ Footer:
 
 ## How to write the history annotation
 
-The little italic line after the status pill is the key piece — it carries the history. Each cluster gets one of these descriptors based on its Notes history field:
+The little italic line after the status pill is the key piece — it carries the history. Each cluster gets one of these descriptors based on its History field:
 
 - **NEW today** — this is the first run the cluster has appeared. Red, attention-grabbing.
 - **+X customer(s)** — cluster grew this run. Name the customer(s) if 1-2, else just count.
@@ -470,9 +493,10 @@ Call RS-DB MCP `send_email` with `to`, `subject`, HTML body. If the call fails, 
 - **Cluster slugs are stable forever** once created. If a cluster's meaning shifts substantially, mark the old one resolved and start a new slug — don't reuse.
 - **Don't merge clusters just because their symptoms look related.** The merge test is "one fix closes all," not "they're about the same area."
 - **Don't touch `cs-*` rows.** Those belong to customer-watch.
-- **Don't touch `cw-*` rows.** Those belong to conversation-watch. This skill only reads them.
+- **Read `cw-state`; never write it.** That record belongs to conversation-watch. This skill reads it and writes only `cl-state`.
+- **One `cl-state` record only.** Never create per-cluster `cl-{slug}` rows — the per-row format is retired. All cluster state lives in the `cl-state` body.
 - **Run date must be the exact UTC time of writeback**, to the second. Never round.
-- **Every RESOLVED write requires a rationale in Notes** — trigger rule, last-active date, days inactive, customer count at last activity. Example: `RESOLVED — 8 consecutive inactive runs (8 days), last active 2026-05-07 with 3 customers.` If you can't construct one (e.g. inactive <7 days, last-active date unknown), do NOT flip to RESOLVED — keep prior Status.
+- **Every RESOLVED write requires a rationale in the cluster's History** — trigger rule, last-active date, days inactive, customer count at last activity. Example: `RESOLVED — 8 consecutive inactive runs (8 days), last active 2026-05-07 with 3 customers.` If you can't construct one (e.g. inactive <7 days, last-active date unknown), do NOT flip to RESOLVED — keep prior Status.
 
 # Chat report-back
 
@@ -485,5 +509,5 @@ Short. One line each:
 - Clusters resolved this run: list of slugs (or "none") — call out which were "merged into cl-X" vs "all symptoms cleared" vs "orphaned" vs "inactive 3 runs"
 - Merges done: list of "cl-X → cl-Y" (or "none") — this is the dedupe signal; over time you want this to trend toward zero as the cluster set stabilizes
 - Singletons absorbed: count (or "none")
-- Symptoms aged out: count of `cw-` rows dropped from clusters because they went RESOLVED/NON ISSUE
+- Symptoms aged out: count of symptoms dropped from clusters because they went RESOLVED/NON ISSUE
 - Anything weird: Notion write failures, mapping ambiguity, etc.
