@@ -1,9 +1,9 @@
 ---
-description: Weekly trend report across all customers. Reads all the Notion rows (conversation-watch Layer 0 symptoms + daily-pulse clusters), identifies accumulating patterns, tracks regression/resolution, and emails an exec summary. Never reads conversations or DB directly — Notion is the input. The top-layer view.
+description: Weekly trend report across all customers. Reads the two Notion records — conversation-watch's symptom record and daily-pulse's cluster record — identifies accumulating patterns, tracks regression/resolution, and emails an exec summary. Never reads conversations or DB directly — Notion is the input. The top-layer view.
 argument-hint: optional comma-separated email recipients (else uses $HEALTH_CHECK_RECIPIENTS or asks)
 ---
 
-You're the weekly strategist. Your input is everything in Notion — all the symptom rows conversation-watch wrote, plus the cluster rows daily-pulse maintains. Your job: zoom out over the past week, find what's getting worse vs better, surface what needs a decision, and send one clean exec summary email. You don't read conversations. You don't query Postgres. Notion is your source of truth.
+You're the weekly strategist. Your input is two Notion records: `cw-state` (every symptom conversation-watch has flagged) and `cl-state` (every cluster daily-pulse maintains, with its history). Your job: zoom out over the past week, find what's getting worse vs better, surface what needs a decision, and send one clean exec summary email. You don't read conversations. You don't query Postgres. Notion is your source of truth.
 
 # When to use this
 
@@ -24,43 +24,45 @@ This skill **never touches Postgres**. No conversation reading, no DB queries.
 # Configuration
 
 - **Email recipients**: `$ARGUMENTS` if provided, else env var `$HEALTH_CHECK_RECIPIENTS`, else ask once.
-- **Window**: all rows — use Run date to identify what was active this week vs prior weeks.
+- **Window**: the last 7 days. Use the dated entries inside each record (issue "Last sighted" / cluster "History") to tell what was active this week vs prior weeks.
 
-# Step 1 — Read all the rows
+# Step 1 — Read the two records
 
-## 1a. Query the view
+## 1a. Locate the records
 
 Call `notion-query-database-view`:
 
 - `view_url: https://www.notion.so/rentsimple/35f9fe3faf4280c69197f5c4d390650a?v=35f9fe3faf4280328b21000c3d59b65d`
 
-This is the **`system-watch-lookup`** view — pre-filtered to `Issue Type = System`. **Do not use the `customer-watch-lookup` view** (`?v=3609fe3faf428049bc99000cd69e28a3`) — that one filters to Customer and will return zero `cw-` rows.
+This is the `system-watch-lookup` view. Find two rows by exact Name and note their page_ids:
 
-Iterate pagination until exhausted. Read everything — MONITORING, OPEN, HIGH ALERT, RESOLVED, NON ISSUE.
+- `cw-state` — conversation-watch's symptom record
+- `cl-state` — daily-pulse's cluster record
 
-## 1b. Build the full picture
+If either is missing, note it in report-back and continue with whatever exists. If both are missing, stop — there's nothing to summarize.
 
-For each row, apply these filters in order. Drop any row that fails any check:
+Ignore every other row. `cs-*` belongs to customer-watch. Obsolete `cw-{company}-{issue}` rows from an old design are not input — if you see a pile of them, note it so the operator can clean up.
 
-1. **Name must match `cw-{company-slug}-{issue-slug}` exactly.** Drop anything else, including:
-   - `cs-*` rows (customer-watch namespace — separate skill, separate row set)
-   - `cw-heartbeat` singleton (operational state, not an issue row)
-   - Any malformed or partial name
-2. **`Issue Type` must equal `System`.** Belt-and-suspenders alongside the name check — both must hold.
+## 1b. Read both record bodies
 
-For each row that survives, parse the Name → extract company slug and issue slug, and read all properties: Status, Streak, Run date, Sample Convs, Notes, Companies.
+`notion-fetch` each record. Parse:
 
-Group into:
-- **Active** — Status MONITORING, OPEN, or HIGH ALERT (regardless of Run date — these are currently-tracked issues even if quiet for the week)
-- **Resolved this week** — Status RESOLVED with Run date in last 7 days (transitions only — older resolutions are stable history)
-- **Long-running** — OPEN or HIGH ALERT with Streak >= 10
-- **Escalating** — MONITORING with Streak >= 2 (approaching OPEN threshold)
-- **Stale-active** — Active rows whose Run date is older than 7 days (still being tracked, but no recent sighting; useful signal)
-- **Suppressed** — NON ISSUE (for count only, not included in email content)
+**From `cw-state`:** the header (run count, last run) and every issue under `## Active issues` and `## Resolved issues` — each with Status, Streak, Customer, Last sighted, Detection signal, Issue description, Notes.
 
-## 1c. Fetch bodies for context
+**From `cl-state`:** the header and every cluster under `## Clusters` and `## Resolved clusters` — each with Status, Streak, Customers, Symptoms list, description, and the dated **History** entries. The History is the spine of the trend story — it's where you see a cluster grow, shrink, or hold steady across the week.
 
-For each active issue row, `notion-fetch` the body to get the Issue description and Detection signal. This is what you use to understand the failure pattern and write the trend narrative.
+## 1c. Build the weekly picture
+
+From the parsed records, group:
+
+- **Active clusters** — `cl-state` clusters with Status MONITORING, OPEN, or HIGH ALERT
+- **Resolved this week** — clusters or issues that moved to RESOLVED with a dated entry in the last 7 days
+- **Long-running** — clusters with Streak >= 10 (active many consecutive runs)
+- **Escalating** — clusters whose History shows customer count rising across the week
+- **Cooling** — clusters whose History shows customer count falling across the week
+- **Active symptoms** — `cw-state` active issues, used to size each cluster and spot brand-new patterns
+
+The cluster History entries already encode most of the trend — lean on them rather than re-deriving from scratch.
 
 # Step 2 — Identify weekly trends
 

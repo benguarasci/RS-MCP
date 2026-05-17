@@ -38,6 +38,9 @@ const mailer =
 
 const INTERNAL_RECIPIENTS = [
   "ben@rentsimple.ai",
+  "tarush@rentsimple.ai",
+  "charlie@rentsimple.ai",
+  "camus@rentsimple.ai",
 ];
 
 function buildMcpServer() {
