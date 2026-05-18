@@ -1,74 +1,76 @@
 ---
-description: Continuous per-conversation monitoring across all customers. Runs every few hours, reads each new/updated conversation message-by-message, flags AI failures, and writes them to Notion as MONITORING issues. No email — Notion is the substrate. Feeds daily-pulse (clusters) and health-check (trends). Use scheduled, not manually.
+description: Continuous per-conversation monitoring across all customers. Runs every few hours, reads each new/updated conversation message-by-message, flags AI failures, and writes them to the watch-state Postgres DB as monitoring issues. No email. Feeds daily-pulse (clusters) and health-check (trends). Use scheduled, not manually.
 argument-hint: optional comma-separated company IDs to scope this run (default: all companies)
 ---
 
-You're a continuous observer of the AI agent's conversations. Each run: pick up every conversation created or updated since the last run, read its messages, flag anything obviously wrong, and write findings to Notion. No email. The output is the Notion state — daily-pulse and health-check consume it later.
+You're a continuous observer of the AI agent's conversations. Each run: pick up every conversation created or updated since the last run, read its messages, flag anything obviously wrong, and write findings to the watch-state database. No email. The output is the `issues` table — daily-pulse and health-check consume it later.
 
 # When to use this
 
-- **conversation-watch** (this one) — runs every 2-4 hours via cron, processes new/updated conversations across the entire portfolio, writes flags to Notion. The substrate.
-- **customer-watch** — manually-curated focused-attention tool for at-risk customers. Reads same Notion DB.
-- **daily-pulse** — clusters Layer 0 flags across customers, sends daily email.
+- **conversation-watch** (this one) — runs every 2-4 hours via cron, processes new/updated conversations across the entire portfolio, writes flags to the watch-state DB. The substrate.
+- **customer-watch** — manually-curated focused-attention tool for at-risk customers. Still Notion-based; separate, do not touch.
+- **daily-pulse** — clusters Layer 0 issues across customers, sends daily email.
 - **health-check** — weekly trends across all layers.
 
 # Required MCP tools
 
-- Postgres MCP (read-only DB)
-- Notion MCP `notion-query-database-view` (primary lookup), `notion-fetch` (body reads), `notion-update-page` + `notion-create-pages` (writeback) on `Self learning db` (`collection://35f9fe3f-af42-80ba-bf81-000b602adf12`)
+Both tools are on the `rs-neon-mcp` server:
 
-If Postgres is missing, stop and report. If Notion is missing, stop — there's no point continuing without the writeback target.
+- **`query`** — read-only SQL against the prod Postgres DB (the conversation data).
+- **`state_query`** — read/write SQL against the watch-state Postgres DB (the `issues`, `companies`, `runs` tables).
 
-This skill **never sends email**. No Gmail, no RS-DB send_email. If you find yourself drafting an email, you're misusing this skill.
+If either tool is missing, stop and report. This skill **never sends email** — no Gmail, no `send_email`. If you find yourself drafting an email, you're misusing this skill.
+
+# The state database
+
+This skill reads prod conversations and writes to the watch-state DB:
+
+- **`issues`** — one row per `(company_id, kind)`. This skill's output. Identity is the natural key `(company_id, kind)` — there are no slugs to construct.
+- **`companies`** — upserted as new customers are seen.
+- **`runs`** — one row per execution; this skill logs its own run.
+
+It **never** writes `clusters` or `cluster_snapshots` — daily-pulse owns those. Read denormalized state from the `v_issues` view; write to the base tables. All of this goes through `state_query`.
+
+Status/severity model:
+
+- **`status`** (lifecycle): `monitoring` → `open` → `resolved`; `dismissed` is terminal (the old "NON ISSUE").
+- **`severity`**: `low` / `medium` / `high` (the old "HIGH ALERT" is `severity = high`).
+- **`streak`**: consecutive runs the issue was sighted.
+- **`clean_runs`**: consecutive runs with no sighting since it was last sighted.
 
 # Configuration
 
 - **Scope**: first arg, optional. If provided, restrict to those company IDs. If empty, process all companies. Operator uses scoping for testing; production runs are unscoped.
-- **Time window**: from the most recent prior conversation-watch run's `Run date` (the `Run date` property on the `cw-state` record — see Step 6) up to now. If `cw-state` doesn't exist yet, default to the last 4 hours.
+- **Time window**: from the start of the most recent *succeeded* conversation-watch run (see Step 2). If there is no prior succeeded run, default to the last 4 hours.
 
-# Namespace
+# Step 0 — Open the run
 
-This skill maintains exactly one Notion record: `cw-state` (`Issue Type = System`). Every symptom it tracks lives as a section inside that record's body — it never writes per-issue rows. customer-watch owns the separate `cs-` namespace; daily-pulse owns `cl-state`. **Never read or write `cs-` rows, and never touch `cl-state`.** If you find yourself about to create any row other than `cw-state`, stop.
+Before anything else, log the run and keep the returned id:
 
-# Step 1 — Read the cw-state record
+```sql
+INSERT INTO runs (layer, status) VALUES ('conversation-watch', 'running') RETURNING id;
+```
 
-This skill maintains a single consolidated record, `cw-state`, in the `Self learning db` data source. Its body holds every tracked symptom as a `### cw-{customer}-{symptom}` section under `## Active issues` / `## Resolved issues`. The old per-issue-row format is retired — there is no per-row map to build.
+If the skill fails partway, the row stays `running` — that's the signal it never completed. The window query in Step 2 only counts `succeeded` runs, so this open row never corrupts the next window.
 
-## 1a. Locate cw-state
+# Step 1 — Load known issues
 
-Call `notion-query-database-view`:
+```sql
+SELECT * FROM v_issues ORDER BY company, kind;
+```
 
-- `view_url: https://www.notion.so/rentsimple/35f9fe3faf4280c69197f5c4d390650a?v=35f9fe3faf4280328b21000c3d59b65d`
+This is your **known-issues map** for the run, keyed by `(company, kind)`. The `detection_signal` field on each row is the mechanical pattern you evaluate new conversations against. **Skip any issue with `status = 'dismissed'`** — never re-flag or resurrect it.
 
-This is the **`system-watch-lookup`** view — pre-filtered to `Issue Type = System`. **Do not use the `customer-watch-lookup` view** (`?v=3609fe3faf428049bc99000cd69e28a3`) — that one filters to `Issue Type = Customer` and will not return `cw-state`. Iterate pagination until exhausted, then pick the single row with Name exactly `cw-state`.
-
-- If `cw-state` exists, that's your record.
-- If `cw-state` does not exist (first ever run), there are no known issues yet — you'll create the record in Step 6.
-- Ignore every other row: `cl-state` belongs to daily-pulse, `cs-*` rows belong to customer-watch, and any legacy per-issue `cw-*` rows are retired. Never read or write them.
-
-## 1b. Fetch and parse the body
-
-`notion-fetch` the `cw-state` page. From its body, read every `### cw-{customer}-{symptom}` section under `## Active issues` and `## Resolved issues`. Each section carries: Status, Streak, Clean runs since last sighting, Customer, Last sighted, Sample convs, Detection signal, Issue, and Notes.
-
-This parsed set is your **known-issues map** for the rest of the run, keyed by the exact `cw-{customer}-{symptom}` slug. The `Detection signal` field on each section is what you evaluate new conversations against.
-
-## 1c. Drop NON ISSUE
-
-Skip any section whose Status is `NON ISSUE` — never re-flag or resurrect it.
-
-## 1d. Hard precondition
-
-Before any writeback the known-issues map must be in hand. If the view query failed, abort the writeback and surface the failure. Do not "best-effort create" a fresh `cw-state` — that would clobber existing history.
+If the query fails, abort before any writeback — acting on a partial map would create duplicate issues.
 
 # Step 2 — Determine the window
 
-Window start = the `Run date` property on the `cw-state` record (the timestamp of this skill's previous run). Window end = now. If `cw-state` doesn't exist yet, default to 4 hours back.
+```sql
+SELECT MAX(started_at) AS window_start
+FROM runs WHERE layer = 'conversation-watch' AND status = 'succeeded';
+```
 
-**Strict rules** (same as customer-watch):
-
-- Use ONLY `cw-state`'s `Run date` property. Never `Last edited time`, `Created time`, or any other timestamp.
-- Treat date-only values as midnight UTC.
-- When writing Run date, always write as a datetime (ISO with time component, `2026-05-14T22:00:00.000Z`).
+Window start = that timestamp; window end = `now()`. If `window_start` is null (first ever run), default to 4 hours back. Get a precise "now" from the DB (`SELECT now()`); never round.
 
 # Step 3 — Pull conversations to process
 
@@ -101,7 +103,7 @@ You will be reading two tables. **Pay attention — there is also a `Message` ta
 
 ## Query
 
-Pull conversations where `updatedAt >= window_start` AND `updatedAt <= now` from `Conversation`. If a scope filter was provided, restrict to those `companyId` values. Join `Company` if you need the company name for reporting.
+Using the **`query`** tool (read-only prod), pull conversations where `updatedAt >= window_start` AND `updatedAt <= now` from `Conversation`. If a scope filter was provided, restrict to those `companyId` values. Join `Company` if you need the company name (and `Company.id`, which is the admin ID) for reporting and the `companies` upsert.
 
 **Read every conversation in the window. No skipping, no cheap filters, no length thresholds.** A short bot-only thread can still hide a real AI failure, and the window is small enough that the cost of reading all of it is acceptable. If volume ever becomes a real problem, raise it then — don't pre-optimize by dropping signal.
 
@@ -120,9 +122,9 @@ Both sides matter — read AI-sent messages AND prospect-sent messages.
 
 # Step 4 — Per-conversation review
 
-For each conversation in the filtered list, read the messages and ask: **did the AI do something obviously wrong?**
+For each conversation, read the messages and ask: **did the AI do something obviously wrong?**
 
-This is the same criteria as customer-watch Step 4 — examples of "obviously wrong":
+Examples of "obviously wrong":
 
 - AI quoted a price that doesn't match listing data
 - AI offered a property in the wrong city / way out of region
@@ -136,130 +138,120 @@ This is the same criteria as customer-watch Step 4 — examples of "obviously wr
 - Conversation had a wrong-bedroom / wrong-property reminder
 - Backend threading bug — multiple prospects merged in one thread
 
-**Single instance is enough.** One flagged conversation creates or updates a MONITORING issue section in `cw-state`.
+**Single instance is enough.** One flagged conversation creates or updates a monitoring issue.
 
 For each flagged conversation, decide:
 
-1. **Does it match a known issue's detection signal for this customer?**
-   - If yes: append the conv ID to that issue section's Sample convs (replace, keep most recent 3). Increment Streak (sighting count for MONITORING; reset to 0 for OPEN/HIGH ALERT since signal fired).
+1. **Does it match a known issue's `detection_signal` for this customer?** (matched on `(company, kind)`)
+   - If yes: it's a sighting of that issue. Add the conv ID to a list for that issue's `sample_convs` (keep most recent 3). Mark the issue sighted this run.
 2. **Is it a new pattern?**
-   - Form a kebab-case slug describing the failure
-   - Note 1+ example conv IDs
-   - Mark for addition as a new MONITORING section in Step 6
+   - Form a kebab-case `kind` describing the failure (e.g. `stale-slot-quoting`, `tour-booking-silent-failure`). The `kind` is stable forever once created.
+   - Note 1+ example conv IDs.
+   - Judge a `severity`: `high` for severe failures (silent booking failure, merged threads, wrong-region quotes), otherwise `medium`.
+   - Mark for insertion as a new `monitoring` issue in Step 6.
 
-## Avoid double-flagging the same conversation
+## Avoid double-counting
 
-Track which conv IDs you process this run. If the same conversation matches two known issues, that's fine — append to both. But never write the same conv ID twice into the same row's Sample Convs.
-
-If a conv ID already appears in the issue section's existing Sample convs from a prior run, don't increment Streak — that conversation has already been counted.
+Track which conv IDs you process this run. A conversation may match two issues — append to both. But never write the same conv ID twice into one issue's `sample_convs`, and if a conv ID already appears in an issue's existing `sample_convs` from a prior run, it is **not** a fresh sighting — don't increment `streak` for it.
 
 ## Tally the run counts
 
-While reviewing conversations this run, maintain two integers for the Run ledger (Step 6):
+Maintain two integers for the run record (Step 6):
 
-- **processed** — the total number of conversations in this run's window (every conversation pulled in Step 3, no filtering). Same number you report in chat report-back.
-- **flagged** — the count of DISTINCT conversation IDs that triggered at least one symptom this run, i.e. a conversation that created a new `### cw-...` section or appended its conv ID to an existing one. Count each conversation once, even if it matched two or more symptoms. A conversation you read but did not flag does not count here.
+- **processed** — total conversations in this run's window (every conversation pulled in Step 3, no filtering).
+- **flagged** — count of DISTINCT conversation IDs that triggered at least one issue this run. Count each conversation once even if it matched multiple issues.
 
-`flagged` is always <= `processed`. If `flagged` exceeds `processed`, you double-counted a conversation — recheck before writeback.
+`flagged` is always <= `processed`. If `flagged` exceeds `processed`, you double-counted — recheck before writeback.
 
-# Step 5 — Status transitions (same as customer-watch Step 3)
+# Step 5 — Status transitions
 
-For each issue touched this run, apply the standard transitions:
+For every known issue (Step 1) plus every new pattern, compute the new state. "Sighted" = the issue fired in at least one conversation this run.
 
-- **MONITORING** (Streak = sighting count). Sighted this run → Streak += 1. At Streak >= 3 → flip to OPEN, reset Streak to 0. Not sighted → no change.
-- **OPEN** (Streak = clean-run count). Sighted this run → Streak = 0. Not sighted → Streak += 1. At Streak >= 30 with no firing this run → flip to RESOLVED.
-- **HIGH ALERT** (Streak = clean-run count, sticky). Sighted → Streak = 0. Not sighted → Streak += 1. At Streak >= 10 → step down to OPEN, preserve Streak.
-- **RESOLVED**. Sighted this run → flip to OPEN (regression), Streak = 0. Otherwise no change.
-- **NON ISSUE**. Skip entirely.
+- **`monitoring`** — sighted → `streak += 1`, `clean_runs = 0`, `last_sighted = now()`. If `streak >= 3` → `status = 'open'`. Not sighted → `clean_runs += 1`.
+- **`open`** — sighted → `streak += 1`, `clean_runs = 0`, `last_sighted = now()`. Not sighted → `clean_runs += 1`. If `clean_runs >= 30` → `status = 'resolved'`, `resolved_at = now()`.
+- **`severity = 'high'`** (sticky, independent of status) — sighted → `clean_runs = 0`. Not sighted → `clean_runs += 1`. If `clean_runs >= 10` → step `severity` down to `medium` (status unchanged).
+- **`resolved`** — sighted this run → regression: `status = 'open'`, `streak = 1`, `clean_runs = 0`, `resolved_at = NULL`. Otherwise no change.
+- **`dismissed`** — skip entirely; never re-flag.
 
-## MONITORING auto-dismissal
+## Monitoring auto-dismissal
 
-A MONITORING issue may auto-dismiss to RESOLVED only when BOTH hold: (a) at least **7 days since first sighting** (use the first-sighted date recorded in the issue section's Notes), AND (b) no sightings in that 7+ day window. Track in the section's Notes: `"first sighted 2026-05-08; 4 clean runs since"`. If the issue was first sighted less than 7 days ago, leave it MONITORING regardless of clean-run count. Every RESOLVED write must include a rationale — see Hard rules.
+A `monitoring` issue auto-resolves only when BOTH hold: `first_sighted` is more than 7 days ago AND `last_sighted` is more than 7 days ago (i.e. no sighting in a 7+ day window). If first sighted less than 7 days ago, leave it `monitoring` regardless of clean-run count. Every auto-resolve must record a rationale in `notes` — see Hard rules.
 
-# Step 6 — Notion writeback
+# Step 6 — Writeback
 
-This skill writes exactly one record: `cw-state`. You rewrite its whole body each run — assemble the full new body in memory, then write it once.
+All writes go through `state_query`. Order: upsert companies, then upsert issues, then close the run.
 
-## Assemble the new cw-state body
+## 6a. Upsert companies
 
-```markdown
-- **Last run:** <ISO datetime this writeback finishes>
-- **Window this run:** <window_start> → <now>
-- **Run count:** <prior run count + 1>
-- **Conversations processed this run:** <processed>
-- **Conversations flagged this run:** <flagged>
-- **Last run summary:** <one line — conversations processed, companies touched, new flags>
+For every company flagged this run, ensure it exists. `admin_id` is the prod `Company.id` (the value behind `/admin/companies/{id}`); `slug` is a kebab-case handle of the name:
 
-## Run ledger
-
-- <ISO datetime of this run> — processed <processed>, flagged <flagged>
-- <prior run line, carried forward verbatim>
-- ... (one line per run, newest first, keep only lines from the last 8 days)
-
-## Active issues
-
-### cw-{customer}-{issue}
-- **Status:** MONITORING | OPEN | HIGH ALERT
-- **Streak:** <number>
-- **Clean runs since last sighting:** <number>
-- **Customer:** <customer name>
-- **Last sighted:** <ISO datetime of most recent sighting>
-- **Sample convs:** <up to 3 conversation IDs, most recent>
-- **Detection signal:** <mechanical pattern — see below>
-- **Issue:** <one sentence — what's wrong from the customer's perspective>
-- **Notes:** <one short line — sighting / clean-run state, plus the first-sighted date>
-
-## Resolved issues
-
-### cw-{customer}-{issue}
-- (same fields; Notes carries the RESOLVED rationale)
+```sql
+INSERT INTO companies (slug, name, admin_id)
+VALUES ('briarlane', 'Briarlane', 76)
+ON CONFLICT (slug) DO UPDATE
+  SET name = excluded.name, admin_id = excluded.admin_id;
 ```
 
-Rules for assembling it:
+## 6b. New issues
 
-- **Carry forward every existing section unchanged** except the ones touched this run. A `replace_content` that drops untouched issues loses history — assemble from the full parsed map (Step 1), not just this run's changes.
-- For an existing issue sighted or transitioned this run: update its Status, Streak, Clean runs since last sighting, Last sighted, Sample convs, and Notes. **Detection signal and Issue stay stable** — never rewrite them once set.
-- For a new pattern found this run: add a new `### cw-{customer}-{issue}` section under `## Active issues`, Status `MONITORING`, with the full field set.
-- **Slugs are stable forever.** A `### cw-{customer}-{issue}` heading never changes once created — that's how history is preserved across runs.
-- When an issue flips to `RESOLVED`, move its section under `## Resolved issues`. If a RESOLVED issue regresses (its signal fires again), move it back under `## Active issues`.
-- Skip `NON ISSUE` sections — leave them as they are; never re-flag them.
-- **Run ledger:** prepend exactly one line for this run to `## Run ledger`, formatted `- <ISO datetime> — processed <N>, flagged <K>`. Use the same ISO datetime (to the second, UTC) as the `Run date` property. Carry forward every prior ledger line verbatim, then drop any line whose timestamp is more than 8 days before now. Newest line first. If `## Run ledger` does not exist yet (records written before this skill version), create it with just this run's line.
-- The `## Run ledger` section is append-and-prune only — never edit or reorder existing lines, never collapse them. daily-pulse reads these raw lines to compute the conversation-health score; rewriting history there corrupts the trend.
+For each new pattern, insert it as `monitoring`. Resolve the `company_id` from the slug in the same statement:
 
-**Detection signal** must be mechanical: describe the pattern in terms of message content (what the AI said, what the prospect said), property/building involvement, error codes, or state metrics. NEVER reference `Conversation.summary`. Future runs evaluate this field against message content.
+```sql
+INSERT INTO issues (company_id, kind, status, severity, streak, clean_runs,
+                    summary, detection_signal, sample_convs, first_sighted, last_sighted)
+SELECT c.id, 'tour-booking-silent-failure', 'monitoring', 'medium', 1, 0,
+       'AI confirmed a tour but the booking never registered.',
+       'AI message states a tour is booked; no booking confirmation message follows.',
+       '["12345","12346"]'::jsonb, now(), now()
+FROM companies c WHERE c.slug = 'briarlane'
+ON CONFLICT (company_id, kind) DO UPDATE
+  SET streak = issues.streak + 1, clean_runs = 0, last_sighted = now(),
+      sample_convs = excluded.sample_convs, status = 'monitoring';
+```
 
-## Write cw-state back
+`summary` and `detection_signal` are written once and **never rewritten** on later runs.
 
-- **If `cw-state` exists** (found in Step 1): `notion-update-page` with `command: replace_content`, passing the full new body as `new_str`; then `update_properties` for the page-level properties below.
-- **If `cw-state` does not exist** (first ever run): `notion-create-pages` with parent `{"type": "data_source_id", "data_source_id": "35f9fe3f-af42-80ba-bf81-000b602adf12"}`, the assembled body as `content`, and the properties below.
+## 6c. Existing issues
 
-Page-level properties on `cw-state`:
+For each known issue, apply the Step 5 transition by `id`:
 
-- **Name** (title): `cw-state` — never changes
-- **Issue Type** (select): `System` (the actual Notion field name is `Issue Type`, not `Type`)
-- **Status** (select): `OPEN` — an operational marker only; semantically meaningless on this record (per-issue status lives in the body)
-- **Companies count** (number): number of companies with conversations processed this run
-- **Run date** (datetime): **the exact UTC time the writeback finishes**, ISO with time component to the second (e.g. `2026-05-15T01:43:08.000Z`). **Do not round to the nearest hour or midnight** — the next run uses this as its window start, so rounding gives the wrong window. If you don't know "now" precisely, query the DB with `SELECT NOW()`.
-- **Notes** (text): one short line, e.g. `Run 14 — processed 87 conversations across 12 companies; 3 new MONITORING flags.`
+```sql
+UPDATE issues
+SET status = 'open', severity = 'medium', streak = 4, clean_runs = 0,
+    last_sighted = now(), sample_convs = '["12350","12348","12345"]'::jsonb,
+    notes = 'sighted this run; promoted monitoring -> open at streak 3'
+WHERE id = 42;
+```
 
-`cw-state` is the only state this skill maintains across runs; the next run reads its `Run date` as the window start. There is no separate `cw-heartbeat` row — that singleton is retired; `cw-state` absorbs its role.
+For an auto-resolve, also set `resolved_at = now()` and a `notes` rationale (trigger rule, first/last-sighted dates, days clean).
 
-**Hard rules against clobbering:**
+- Update only the rows that changed this run. An untouched issue (not sighted, no transition) still needs `clean_runs += 1` — apply that.
+- **`kind`, `summary`, `detection_signal` are stable** — never rewrite them once set.
+- Do not set `updated_at` — the DB trigger maintains it.
 
-- Never `notion-create-pages` when `cw-state` already exists — that creates a duplicate. Update the existing record in place.
-- Never write a second `cw-state`, never write per-issue `cw-*` rows, never write `cl-state` or `cs-*` rows.
-- Every `### cw-{customer}-{issue}` slug must match that pattern exactly. No suffixes, no `cs-` prefix ever.
+## 6d. Close the run
+
+```sql
+UPDATE runs
+SET status = 'succeeded', finished_at = now(),
+    summary = 'Run processed 87 conversations across 12 companies; 3 new monitoring flags.',
+    stats = '{"processed":87,"flagged":9,"companies":12,"new_issues":3}'::jsonb
+WHERE id = <run_id>;
+```
+
+If the run failed before this point, leave the row `running` (or set it to `failed` with a summary if you can).
 
 # Hard rules
 
-- Read-only on the DB.
-- **Read message-level data, not summaries.** Every conversation check must read actual `ConversationMessage` rows (NOT `Message` — that's a different table for an unrelated chat feature). `Conversation.summary` is a post-hoc rollup and unreliable; use only as orientation hint, never as source of truth.
-- **No email.** This skill writes to Notion only.
+- Read-only on the prod DB (`query`). Reads and writes only to the watch-state DB (`state_query`), and only the `issues`, `companies`, `runs` tables.
+- **Read message-level data, not summaries.** Every check must read actual `ConversationMessage` rows (NOT `Message` — a different table). `Conversation.summary` is unreliable; use only as an orientation hint.
+- **No email.** This skill writes to the state DB only.
 - No emojis.
-- Never propose fixes, file tickets, recommend Linear actions. This skill records observations. Higher layers (daily-pulse, health-check) do analysis.
-- Status writes must use exact Select values: `OPEN`, `MONITORING`, `RESOLVED`, `HIGH ALERT`, `NON ISSUE`. Any other value is a bug — skip the write and surface in report-back.
-- **Never write `cs-` rows or `cl-state`.** Those belong to customer-watch and daily-pulse. This skill writes only the `cw-state` record.
-- **Every RESOLVED write requires a rationale in the issue section's Notes** — trigger rule, first-sighted date, last-sighted date, days clean. Example: `RESOLVED — MONITORING auto-dismissal. First sighted 2026-05-01, last sighted 2026-05-02, 13 days clean.` If you can't construct one (e.g. issue first sighted <7 days ago, last-sighted unknown), do NOT flip to RESOLVED — leave the issue in its current status.
+- Never propose fixes, file tickets, or recommend Linear actions. This skill records observations. Higher layers do analysis.
+- `status` writes must be exactly `open`, `monitoring`, `resolved`, or `dismissed`; `severity` exactly `low`, `medium`, or `high`. The DB domains will reject anything else — if a write is rejected, skip it and surface in report-back.
+- **`detection_signal` must be mechanical** — describe the pattern in terms of message content, property/building involvement, error codes, or state metrics. NEVER reference `Conversation.summary`. Future runs evaluate this field against message content.
+- Never write `clusters` or `cluster_snapshots` — those belong to daily-pulse.
+- **Every resolve requires a rationale in `notes`** — trigger rule, first-sighted date, last-sighted date, days clean. If you can't construct one (e.g. issue first sighted <7 days ago), do NOT resolve — leave the issue in its current status.
 
 # Chat report-back
 
@@ -267,10 +259,10 @@ Very short. One line each:
 
 - Runs at: timestamp (now)
 - Window: `{window_start}` → `{now}`
-- Conversations processed: N (every conversation in the window — no filtering); flagged: K (distinct conversations); ledger line appended
-- New MONITORING flags this run: K (with slugs if K <= 5, else just count)
-- Issues sighted (existing rows updated): J
+- Conversations processed: N; flagged: K (distinct)
+- New monitoring flags this run: K (with `kind` slugs if K <= 5, else just count)
+- Existing issues updated: J
 - Companies touched: L
-- Anything weird: Notion write failures, schema rejections, etc.
+- Anything weird: state_query write failures, domain rejections, etc.
 
 That's it. No summary, no recommendations. Higher layers do that.
