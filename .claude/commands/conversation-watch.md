@@ -153,6 +153,15 @@ Track which conv IDs you process this run. If the same conversation matches two 
 
 If a conv ID already appears in the issue section's existing Sample convs from a prior run, don't increment Streak — that conversation has already been counted.
 
+## Tally the run counts
+
+While reviewing conversations this run, maintain two integers for the Run ledger (Step 6):
+
+- **processed** — the total number of conversations in this run's window (every conversation pulled in Step 3, no filtering). Same number you report in chat report-back.
+- **flagged** — the count of DISTINCT conversation IDs that triggered at least one symptom this run, i.e. a conversation that created a new `### cw-...` section or appended its conv ID to an existing one. Count each conversation once, even if it matched two or more symptoms. A conversation you read but did not flag does not count here.
+
+`flagged` is always <= `processed`. If `flagged` exceeds `processed`, you double-counted a conversation — recheck before writeback.
+
 # Step 5 — Status transitions (same as customer-watch Step 3)
 
 For each issue touched this run, apply the standard transitions:
@@ -177,7 +186,15 @@ This skill writes exactly one record: `cw-state`. You rewrite its whole body eac
 - **Last run:** <ISO datetime this writeback finishes>
 - **Window this run:** <window_start> → <now>
 - **Run count:** <prior run count + 1>
+- **Conversations processed this run:** <processed>
+- **Conversations flagged this run:** <flagged>
 - **Last run summary:** <one line — conversations processed, companies touched, new flags>
+
+## Run ledger
+
+- <ISO datetime of this run> — processed <processed>, flagged <flagged>
+- <prior run line, carried forward verbatim>
+- ... (one line per run, newest first, keep only lines from the last 8 days)
 
 ## Active issues
 
@@ -206,6 +223,8 @@ Rules for assembling it:
 - **Slugs are stable forever.** A `### cw-{customer}-{issue}` heading never changes once created — that's how history is preserved across runs.
 - When an issue flips to `RESOLVED`, move its section under `## Resolved issues`. If a RESOLVED issue regresses (its signal fires again), move it back under `## Active issues`.
 - Skip `NON ISSUE` sections — leave them as they are; never re-flag them.
+- **Run ledger:** prepend exactly one line for this run to `## Run ledger`, formatted `- <ISO datetime> — processed <N>, flagged <K>`. Use the same ISO datetime (to the second, UTC) as the `Run date` property. Carry forward every prior ledger line verbatim, then drop any line whose timestamp is more than 8 days before now. Newest line first. If `## Run ledger` does not exist yet (records written before this skill version), create it with just this run's line.
+- The `## Run ledger` section is append-and-prune only — never edit or reorder existing lines, never collapse them. daily-pulse reads these raw lines to compute the conversation-health score; rewriting history there corrupts the trend.
 
 **Detection signal** must be mechanical: describe the pattern in terms of message content (what the AI said, what the prospect said), property/building involvement, error codes, or state metrics. NEVER reference `Conversation.summary`. Future runs evaluate this field against message content.
 
@@ -248,7 +267,7 @@ Very short. One line each:
 
 - Runs at: timestamp (now)
 - Window: `{window_start}` → `{now}`
-- Conversations processed: N (every conversation in the window — no filtering)
+- Conversations processed: N (every conversation in the window — no filtering); flagged: K (distinct conversations); ledger line appended
 - New MONITORING flags this run: K (with slugs if K <= 5, else just count)
 - Issues sighted (existing rows updated): J
 - Companies touched: L

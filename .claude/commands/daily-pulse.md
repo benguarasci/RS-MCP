@@ -67,6 +67,28 @@ From `cl-state`'s body (if it exists), read every `### cl-{slug}` section under 
 
 If the view query fails, or `cw-state` cannot be fetched, stop. Do not do a partial writeback. Surface the failure in the chat report-back.
 
+## 1f. Parse and bucket the run ledger
+
+From `cw-state`'s body, read the `## Run ledger` section — a list of lines formatted `- <ISO datetime> — processed <N>, flagged <K>`, newest first. This section is written by conversation-watch; this skill only reads it.
+
+If `## Run ledger` is missing or empty (older `cw-state`, or conversation-watch has not run since the ledger feature shipped), skip the health score entirely — Step 4 renders the no-data fallback. Do not stop the run; the cluster brief still goes out.
+
+Otherwise, bucket the ledger lines into 7 rolling 24-hour windows ending at now:
+
+- Window 0 = `[now − 24h, now]`
+- Window 1 = `[now − 48h, now − 24h]`
+- ... through Window 6 = `[now − 168h, now − 144h]`
+
+For each window, sum `processed` and `flagged` across every ledger line whose timestamp falls inside it. A window with no ledger lines is a data gap — keep it null, do not treat it as zero.
+
+Compute:
+
+- **today's clean rate** — from Window 0: `clean_pct = round(100 × (processed − flagged) / processed)`. If Window 0's `processed` is 0 or the window is a gap, there is no score this run — render the no-data fallback.
+- **yesterday's clean rate** — same formula on Window 1. If Window 1 is a gap or 0, omit the "yesterday" comparison.
+- **flag rate per window** — for each of the 7 windows, `flag_rate = flagged / processed` (a fraction; null if the window is a gap or `processed` is 0). Used for the sparkline.
+
+Hold these numbers for Step 4.
+
 # Step 2 — Map symptoms to clusters
 
 A **cluster** is a set of symptoms where, if you fixed the underlying cause, all the symptoms in the set would stop firing. That is the only test for what belongs in a cluster.
@@ -211,10 +233,44 @@ Examples:
 
 ## Body structure
 
-1. **Topline** — total active clusters, total active symptoms, total customers affected, any HIGH ALERT items called out
-2. **Active clusters** — every cluster with Status `MONITORING`, `OPEN`, or `HIGH ALERT`. Each one shows: name, current customer count, current symptom count, status pill, history annotation (NEW / +X / -Y / steady / growing / shrinking), one-sentence description, list of currently-affected customers.
-3. **Resolved since last run** — any cluster that flipped to `RESOLVED` this run. One line each. Disappears after one appearance.
-4. **Footer** — generation time, source
+1. **Health score** — the conversation-health block, rendered above the topline. Shows today's clean rate as a large percentage, a detail line, and a 7-day sparkline. See "How to render the health block" below. If there is no ledger data (Step 1f), render the no-data fallback instead.
+2. **Topline** — total active clusters, total active symptoms, total customers affected, any HIGH ALERT items called out
+3. **Active clusters** — every cluster with Status `MONITORING`, `OPEN`, or `HIGH ALERT`. Each one shows: name, current customer count, current symptom count, status pill, history annotation (NEW / +X / -Y / steady / growing / shrinking), one-sentence description, list of currently-affected customers.
+4. **Resolved since last run** — any cluster that flipped to `RESOLVED` this run. One line each. Disappears after one appearance.
+5. **Footer** — generation time, source
+
+## How to render the health block
+
+The health block sits between the header and the topline. It answers, at a glance: what fraction of conversations went cleanly today?
+
+**Score and color.** The big number is `clean_pct` from Step 1f, formatted `NN%`. Choose the `.score` color class:
+
+- `clean_pct >= 97` → no class (green, the default `.score` color)
+- `93 <= clean_pct < 97` → add class `warn`
+- `clean_pct < 93` → add class `bad`
+
+If there is at least one active `HIGH ALERT` cluster this run, never render green — use at minimum the `warn` class regardless of `clean_pct`. A high clean rate must not mask a serious cluster.
+
+**Detail line.** One line, format:
+
+`<flagged> of <processed> conversation checks flagged · <cluster posture> · yesterday <NN>%`
+
+- Use `processed` and `flagged` from Window 0. The wording is "conversation checks", not "conversations" — a conversation updated twice in a day is checked by conversation-watch twice, so these are checks, not distinct threads. Do not change this wording.
+- `<cluster posture>` — if any HIGH ALERT cluster exists: `N HIGH ALERT cluster(s)`; else if any OPEN: `N OPEN cluster(s)`; else `clusters steady`.
+- Omit the `· yesterday NN%` segment if Window 1 had no data (Step 1f).
+
+**Sparkline.** A 7-character run of Unicode block characters showing the flag-rate trend, oldest on the left, newest (Window 0) on the right. Block alphabet, index 0–7: `▁▂▃▄▅▆▇█`.
+
+Algorithm:
+1. Take the 7 `flag_rate` values from Step 1f, ordered Window 6 → Window 0 (oldest to newest).
+2. From the non-null values, find `lo` (min) and `hi` (max).
+3. For each window:
+   - null (data gap) → render `·` (middle dot)
+   - `hi == lo` (all equal) → render `▄`
+   - otherwise → `idx = round(7 × (flag_rate − lo) / (hi − lo))`, render block alphabet `[idx]`
+4. Concatenate the 7 characters. Taller block = higher flag rate = worse. The sparkline is relative (normalized to its own 7-day min/max) — the absolute number lives in the score, not here.
+
+**No-data fallback.** If Step 1f produced no score (no ledger, or Window 0 empty/zero `processed`), render the fallback block instead of the full block — see the skeleton below.
 
 ## Ordering
 
@@ -266,6 +322,49 @@ No numeric prominence score. Just severity + recency-of-change.
     margin-bottom: 22px;
     font-size: 14px;
     color: #3d3b35;
+  }
+  .health {
+    background: #fbfaf4;
+    border: 1px solid #e3decf;
+    border-left: 3px solid #cc785c;
+    border-radius: 10px;
+    padding: 16px 18px;
+    margin-bottom: 14px;
+  }
+  .health .score {
+    font-family: Georgia, serif;
+    font-size: 34px;
+    font-weight: 500;
+    color: #3d5c2b;
+    line-height: 1;
+    vertical-align: middle;
+  }
+  .health .score.warn { color: #8a4a30; }
+  .health .score.bad  { color: #8c3527; }
+  .health .score-label {
+    font-size: 14px;
+    color: #3d3b35;
+    margin-left: 8px;
+    vertical-align: middle;
+  }
+  .health .health-detail {
+    font-size: 12px;
+    color: #6e6c64;
+    margin-top: 6px;
+  }
+  .health .spark {
+    font-family: "SF Mono", Menlo, Consolas, monospace;
+    font-size: 16px;
+    letter-spacing: 2px;
+    color: #8a4a30;
+    margin-top: 8px;
+  }
+  .health .spark-cap {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    font-size: 11px;
+    letter-spacing: 0;
+    color: #a09b8e;
+    font-style: italic;
   }
   a {
     color: #8a4a30;
@@ -377,9 +476,23 @@ Header + topline:
     <h1>RS daily pulse — YYYY-MM-DD</h1>
     <div class="sub">Active issue clusters across all customers · status with history</div>
   </div>
+  <div class="health">
+    <span class="score">96%</span>
+    <span class="score-label">conversations clean today</span>
+    <div class="health-detail">77 of 1,847 conversation checks flagged · 1 HIGH ALERT cluster · yesterday 94%</div>
+    <div class="spark">▂▃▅▂▄▆▇ <span class="spark-cap">flag rate · last 7 days · newest right · relative scale</span></div>
+  </div>
   <div class="topline">
     <b>Active:</b> N clusters · M symptoms across K customers · H HIGH ALERT
   </div>
+```
+
+Health block — no-data fallback (use when Step 1f produced no score):
+
+```html
+<div class="health">
+  <div class="health-detail">Conversation-health score unavailable — no conversation-watch run ledger data in the last 24h.</div>
+</div>
 ```
 
 Cluster card (one per active cluster):
