@@ -59,7 +59,13 @@ If the skill fails partway, the row stays `running` — that's the signal it nev
 SELECT * FROM v_issues ORDER BY company, kind;
 ```
 
-This is your **known-issues map** for the run, keyed by `(company, kind)`. The `detection_signal` field on each row is the mechanical pattern you evaluate new conversations against. **Skip any issue with `status = 'dismissed'`** — never re-flag or resurrect it.
+This is your **known-issues map** for the run, keyed by `(company, kind)`. The `detection_signal` field on each row is the mechanical pattern you evaluate new conversations against.
+
+**Dismissed issues stay in the map.** A row with `status = 'dismissed'` was marked a non-issue by the operator. Keep it in the map so a re-detection of the same `(company, kind)` *matches* it and is then left alone — never reopen it, and never let a dismissed pattern be re-inserted as a "new" pattern.
+
+**`origin = 'operator'` issues are first-class monitoring targets.** The operator created them by hand and wants them watched. Evaluate conversations against them every run, exactly like watcher-detected issues. An operator issue may have no `detection_signal` — in that case use its `summary` as the pattern to look for.
+
+**Read `operator_note`.** If an issue carries an `operator_note`, that is the operator's commentary for this run — context, what to ignore, what to look at harder. Factor it into your judgment for that `(company, kind)`. It is operator-owned: read it, never overwrite or clear it.
 
 If the query fails, abort before any writeback — acting on a partial map would create duplicate issues.
 
@@ -142,9 +148,10 @@ Examples of "obviously wrong":
 
 For each flagged conversation, decide:
 
-1. **Does it match a known issue's `detection_signal` for this customer?** (matched on `(company, kind)`)
-   - If yes: it's a sighting of that issue. Add the conv ID to a list for that issue's `sample_convs` (keep most recent 3). Mark the issue sighted this run.
-2. **Is it a new pattern?**
+1. **Does it match a known issue's `detection_signal` — or, for an operator-created issue, its `summary` — for this customer?** (matched on `(company, kind)`)
+   - If the matched issue is **`dismissed`**: the operator ruled it a non-issue. Do nothing — it is not a sighting and it is not a new pattern. Leave the row untouched.
+   - Otherwise: it's a sighting of that issue. Add the conv ID to a list for that issue's `sample_convs` (keep most recent 3). Mark the issue sighted this run.
+2. **Is it a new pattern?** Only if it matches *no* existing issue at all — including dismissed ones. A `(company, kind)` already in the map, whatever its status, is never re-created as new.
    - Form a kebab-case `kind` describing the failure (e.g. `stale-slot-quoting`, `tour-booking-silent-failure`). The `kind` is stable forever once created.
    - Note 1+ example conv IDs.
    - Judge a `severity`: `high` for severe failures (silent booking failure, merged threads, wrong-region quotes), otherwise `medium`.
@@ -171,7 +178,7 @@ For every known issue (Step 1) plus every new pattern, compute the new state. "S
 - **`open`** — sighted → `streak += 1`, `clean_runs = 0`, `last_sighted = now()`. Not sighted → `clean_runs += 1`. If `clean_runs >= 30` → `status = 'resolved'`, `resolved_at = now()`.
 - **`severity = 'high'`** (sticky, independent of status) — sighted → `clean_runs = 0`. Not sighted → `clean_runs += 1`. If `clean_runs >= 10` → step `severity` down to `medium` (status unchanged).
 - **`resolved`** — sighted this run → regression: `status = 'open'`, `streak = 1`, `clean_runs = 0`, `resolved_at = NULL`. Otherwise no change.
-- **`dismissed`** — skip entirely; never re-flag.
+- **`dismissed`** — skip entirely. Never re-flag, never reopen, never write to the row. Only an operator un-dismisses it.
 
 ## Monitoring auto-dismissal
 
@@ -206,10 +213,11 @@ SELECT c.id, 'tour-booking-silent-failure', 'monitoring', 'medium', 1, 0,
 FROM companies c WHERE c.slug = 'briarlane'
 ON CONFLICT (company_id, kind) DO UPDATE
   SET streak = issues.streak + 1, clean_runs = 0, last_sighted = now(),
-      sample_convs = excluded.sample_convs, status = 'monitoring';
+      sample_convs = excluded.sample_convs, status = 'monitoring'
+  WHERE issues.status <> 'dismissed';
 ```
 
-`summary` and `detection_signal` are written once and **never rewritten** on later runs.
+`summary` and `detection_signal` are written once and **never rewritten** on later runs. The `WHERE issues.status <> 'dismissed'` guard ensures a re-detected pattern can never silently reopen an issue the operator dismissed. New patterns insert with the default `origin = 'watcher'` — never set `origin` yourself.
 
 ## 6c. Existing issues
 
@@ -251,6 +259,8 @@ If the run failed before this point, leave the row `running` (or set it to `fail
 - `status` writes must be exactly `open`, `monitoring`, `resolved`, or `dismissed`; `severity` exactly `low`, `medium`, or `high`. The DB domains will reject anything else — if a write is rejected, skip it and surface in report-back.
 - **`detection_signal` must be mechanical** — describe the pattern in terms of message content, property/building involvement, error codes, or state metrics. NEVER reference `Conversation.summary`. Future runs evaluate this field against message content.
 - Never write `clusters` or `cluster_snapshots` — those belong to daily-pulse.
+- **Never reopen a `dismissed` issue**, and never re-insert a dismissed `(company, kind)` as new. Dismissal is the operator's call; only an operator un-dismisses.
+- **`operator_note` is operator-owned** — read it as guidance for the run, never write or clear it. **`origin` is set at creation** — never change it; conversation-watch's own new issues keep the default `watcher`.
 - **Every resolve requires a rationale in `notes`** — trigger rule, first-sighted date, last-sighted date, days clean. If you can't construct one (e.g. issue first sighted <7 days ago), do NOT resolve — leave the issue in its current status.
 
 # Chat report-back

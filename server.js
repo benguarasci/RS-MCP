@@ -4,6 +4,16 @@ import pg from "pg";
 import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import {
+  esc,
+  SEV_RANK,
+  renderDashboard,
+  renderCluster,
+  renderCompany,
+  renderIssue,
+  renderNewIssueForm,
+  renderNotFound,
+} from "./views.js";
 
 const { Pool } = pg;
 
@@ -229,356 +239,120 @@ function buildMcpServer() {
   return server;
 }
 
-const SEV_RANK = { high: 0, medium: 1, low: 2 };
+// ---- dashboard helpers -----------------------------------------------------
 
-// Failure-mode categories — the top tier above clusters. Order here is the
-// tab order on the dashboard. Keys match the issue_category domain in
-// migration 0002. Clusters with a null/unknown category fall into an
-// "Uncategorized" tab appended at runtime.
-const CATEGORIES = [
-  { key: "fabrication", label: "Fabrication" },
-  { key: "stale-or-wrong-data", label: "Stale / wrong data" },
-  { key: "unbacked-action-claims", label: "Unbacked claims" },
-  { key: "tool-and-pipeline-failures", label: "Tool & pipeline" },
-  { key: "context-and-identity-loss", label: "Context & identity" },
-  { key: "dropped-or-blocked-conversations", label: "Dropped / blocked" },
-  { key: "policy-and-safety-violations", label: "Policy & safety" },
-];
-
-// Base URL for admin deep-links (company + conversation pages).
-const APP_BASE_URL = process.env.APP_BASE_URL || "https://www.rentsimple.ai";
-
-function esc(value) {
-  return String(value ?? "")
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;");
-}
-
-function fmtTime(value) {
-  if (!value) return "—";
-  return new Date(value).toISOString().replace("T", " ").slice(0, 16) + " UTC";
-}
-
-// Conversation-health score — buckets conversation-watch run stats into 7
-// rolling 24h windows, mirroring daily-pulse Step 1e. Returns null when
-// today's window has no data (no score this render).
-const HEALTH_BLOCKS = "▁▂▃▄▅▆▇█";
-
-function computeHealth(cwRuns) {
-  const now = Date.now();
-  const DAY = 86400000;
-  const windows = [];
-  for (let w = 0; w < 7; w++) {
-    const hi = now - w * DAY;
-    const lo = hi - DAY;
-    let processed = 0;
-    let flagged = 0;
-    let hasRun = false;
-    for (const r of cwRuns) {
-      const t = new Date(r.started_at).getTime();
-      if (t > lo && t <= hi) {
-        hasRun = true;
-        processed += Number(r.stats && r.stats.processed) || 0;
-        flagged += Number(r.stats && r.stats.flagged) || 0;
-      }
-    }
-    windows.push(hasRun ? { processed, flagged } : null);
+// Validate the auth token (query or form body) and that the state DB is wired
+// up. Returns the token string, or null after sending an error response.
+function dashAuth(req, res) {
+  const token = req.query.token || (req.body && req.body.token);
+  if (token !== AUTH_TOKEN) {
+    res.status(401).send("unauthorized");
+    return null;
   }
-  const w0 = windows[0];
-  if (!w0 || w0.processed === 0) return null;
-  const cleanPct = Math.round(
-    (100 * (w0.processed - w0.flagged)) / w0.processed,
+  if (!statePool) {
+    res.status(503).send("STATE_DATABASE_URL is not configured");
+    return null;
+  }
+  return token;
+}
+
+// Rail data shared by every page: category counts + a cluster lookup map.
+async function loadRail() {
+  const { rows } = await statePool.query(
+    "SELECT id, slug, category FROM clusters",
   );
-  const w1 = windows[1];
-  const yesterdayPct =
-    w1 && w1.processed > 0
-      ? Math.round((100 * (w1.processed - w1.flagged)) / w1.processed)
-      : null;
-  // Flag rates oldest -> newest (window 6 -> window 0) for the sparkline.
-  const rates = [];
-  for (let w = 6; w >= 0; w--) {
-    const win = windows[w];
-    rates.push(win && win.processed > 0 ? win.flagged / win.processed : null);
+  const categoryCounts = {};
+  for (const r of rows) {
+    if (r.category) {
+      categoryCounts[r.category] = (categoryCounts[r.category] || 0) + 1;
+    }
   }
-  const nonNull = rates.filter((r) => r != null);
-  const lo = Math.min(...nonNull);
-  const hi = Math.max(...nonNull);
-  const spark = rates
-    .map((r) => {
-      if (r == null) return "·";
-      if (hi === lo) return "▄";
-      return HEALTH_BLOCKS[Math.round((7 * (r - lo)) / (hi - lo))];
-    })
-    .join("");
+  const clusterMeta = new Map(
+    rows.map((r) => [String(r.id), { slug: r.slug, category: r.category }]),
+  );
+  return { categoryCounts, totalClusters: rows.length, clusterMeta };
+}
+
+function parseFilters(q) {
   return {
-    cleanPct,
-    processed: w0.processed,
-    flagged: w0.flagged,
-    yesterdayPct,
-    spark,
+    category: q.category || "",
+    severity: q.severity || "",
+    status: q.status || "",
+    company: q.company || "",
+    q: q.q || "",
+    sort: q.sort || "",
   };
 }
 
-function renderDashboard(clusters, issues, runs, cwRuns) {
-  const issuesByCluster = new Map();
-  const unclustered = [];
-  for (const issue of issues) {
-    if (issue.cluster_id == null) {
-      if (issue.status !== "resolved" && issue.status !== "dismissed") {
-        unclustered.push(issue);
-      }
-      continue;
-    }
-    if (!issuesByCluster.has(issue.cluster_id)) {
-      issuesByCluster.set(issue.cluster_id, []);
-    }
-    issuesByCluster.get(issue.cluster_id).push(issue);
-  }
-
-  const bySeverity = (a, b) => SEV_RANK[a.severity] - SEV_RANK[b.severity];
-  const active = clusters
-    .filter((c) => c.status !== "resolved")
-    .sort(bySeverity);
-  const resolved = clusters.filter((c) => c.status === "resolved");
-
-  // Group active clusters into category tabs. Anything with a null or unknown
-  // category lands in an "Uncategorized" tab appended only when non-empty.
-  const knownKeys = new Set(CATEGORIES.map((c) => c.key));
-  const tabs = CATEGORIES.map((cat) => ({
-    key: cat.key,
-    label: cat.label,
-    clusters: active.filter((c) => c.category === cat.key),
-  }));
-  const uncategorized = active.filter((c) => !knownKeys.has(c.category));
-  if (uncategorized.length) {
-    tabs.push({
-      key: "uncategorized",
-      label: "Uncategorized",
-      clusters: uncategorized,
-    });
-  }
-  // Default to the first tab that actually has clusters.
-  const activeTabIdx = Math.max(
-    0,
-    tabs.findIndex((t) => t.clusters.length),
-  );
-
-  // Render an issue's sample conversations as deep-links to the admin
-  // conversation viewer. sample_convs is a jsonb array of conversation IDs.
-  const convLinks = (convs) => {
-    if (!Array.isArray(convs) || !convs.length) return "";
-    return (
-      ' <span class="convs">' +
-      convs
-        .map(
-          (c) =>
-            `<a href="${APP_BASE_URL}/admin/conversations?conversationId=${encodeURIComponent(c)}">#${esc(c)}</a>`,
-        )
-        .join(" ") +
-      "</span>"
+function filterClusters(clusters, issues, f) {
+  let list = clusters;
+  if (f.category) list = list.filter((c) => c.category === f.category);
+  if (f.severity) list = list.filter((c) => c.severity === f.severity);
+  if (f.status) list = list.filter((c) => c.status === f.status);
+  if (f.company) {
+    const ids = new Set(
+      issues
+        .filter((i) => i.company_slug === f.company)
+        .map((i) => String(i.cluster_id)),
     );
-  };
-
-  const issueRow = (i) => `
-        <li>
-          <span class="dot sev-${esc(i.severity)}"></span>
-          <b>${esc(i.company)}</b> &middot; ${esc(i.kind)}
-          <span class="muted">${esc(i.status)} &middot; streak ${esc(i.streak)}</span>${convLinks(i.sample_convs)}
-        </li>`;
-
-  const clusterCard = (c) => {
-    const list = (issuesByCluster.get(c.id) || [])
-      .slice()
-      .sort(bySeverity)
-      .map(issueRow)
-      .join("");
-    return `
-      <div class="card">
-        <div class="card-head">
-          <span class="name">${esc(c.slug)}</span>
-          <span class="pill st-${esc(c.status)}">${esc(c.status)}</span>
-          <span class="pill sv-${esc(c.severity)}">${esc(c.severity)}</span>
-        </div>
-        <div class="muted meta">${esc(c.company_count)} companies &middot; ${esc(c.issue_count)} active issues &middot; streak ${esc(c.streak)}</div>
-        <p class="desc">${esc(c.description)}</p>
-        <ul class="issues">${list || '<li class="muted">no linked issues</li>'}</ul>
-      </div>`;
-  };
-
-  const runLine =
-    runs.length > 0
-      ? runs
-          .map((r) => `${esc(r.layer)} ${fmtTime(r.last_run)}`)
-          .join("  &middot;  ")
-      : "no successful runs recorded yet";
-
-  // Conversation-health block — the percentage overview from the email.
-  const health = computeHealth(cwRuns || []);
-  const highAlert = active.filter((c) => c.severity === "high").length;
-  const openCount = active.filter((c) => c.status === "open").length;
-  let healthBlock;
-  if (!health) {
-    healthBlock = `
-  <div class="health">
-    <div class="health-detail">Conversation-health score unavailable — no conversation-watch runs in the last 24h.</div>
-  </div>`;
-  } else {
-    let scoreClass = "";
-    if (health.cleanPct < 93) scoreClass = "bad";
-    else if (health.cleanPct < 97) scoreClass = "warn";
-    if (highAlert > 0 && scoreClass === "") scoreClass = "warn";
-    const posture =
-      highAlert > 0
-        ? `${highAlert} HIGH ALERT cluster${highAlert > 1 ? "s" : ""}`
-        : openCount > 0
-          ? `${openCount} OPEN cluster${openCount > 1 ? "s" : ""}`
-          : "clusters steady";
-    const yest =
-      health.yesterdayPct != null
-        ? ` &middot; yesterday ${health.yesterdayPct}%`
-        : "";
-    healthBlock = `
-  <div class="health">
-    <span class="score${scoreClass ? " " + scoreClass : ""}">${health.cleanPct}%</span>
-    <span class="score-label">conversations clean today</span>
-    <div class="health-detail">${health.flagged} of ${health.processed} conversation checks flagged &middot; ${esc(posture)}${yest}</div>
-    <div class="spark">${health.spark} <span class="spark-cap">flag rate &middot; last 7 days &middot; newest right</span></div>
-  </div>`;
+    list = list.filter((c) => ids.has(String(c.id)));
   }
-
-  return `<!doctype html>
-<html><head><meta charset="utf-8"/>
-<meta name="viewport" content="width=device-width, initial-scale=1"/>
-<title>RS watch — issues</title>
-<style>
-  body { margin:0; padding:28px 16px 80px; background:#f5f4ed; color:#2c2b27;
-         font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; line-height:1.55; }
-  .wrap { max-width:720px; margin:0 auto; }
-  h1 { font-family:Georgia,serif; font-weight:500; font-size:23px; margin:0 0 4px; }
-  h2 { font-family:Georgia,serif; font-style:italic; font-weight:500; font-size:16px;
-       margin:30px 0 10px; }
-  .sub { color:#827e76; font-size:12px; margin-bottom:22px; }
-  .card { background:#fbfaf4; border:1px solid #e3decf; border-radius:10px;
-          padding:15px 17px; margin:13px 0; }
-  .card-head { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
-  .name { font-family:Georgia,serif; font-size:16px; }
-  .meta { margin:3px 0 6px; }
-  .desc { font-size:14px; margin:6px 0 10px; }
-  .muted { color:#827e76; font-size:12px; font-weight:400; }
-  .pill { font-size:10px; letter-spacing:.04em; text-transform:uppercase;
-          padding:2px 8px; border-radius:999px; font-weight:600; }
-  .st-open { background:#f0d9cc; color:#8a4a30; }
-  .st-monitoring { background:#ede8d8; color:#807548; }
-  .st-resolved { background:#dfecd5; color:#3d5c2b; }
-  .sv-high { background:#ecc8c0; color:#8c3527; }
-  .sv-medium { background:#f0d9cc; color:#8a4a30; }
-  .sv-low { background:#ede8d8; color:#807548; }
-  ul.issues { list-style:none; margin:0; padding:0; }
-  ul.issues li { padding:4px 0; border-top:1px solid #efebdd; font-size:13px; }
-  ul.issues li:first-child { border-top:0; }
-  .dot { display:inline-block; width:7px; height:7px; border-radius:50%;
-         margin-right:5px; vertical-align:middle; }
-  .dot.sev-high { background:#8c3527; }
-  .dot.sev-medium { background:#cc785c; }
-  .dot.sev-low { background:#bdb48f; }
-  .empty { color:#827e76; font-style:italic; font-size:14px; }
-  a { color:#8a4a30; text-decoration:none; }
-  a:hover { text-decoration:underline; }
-  .convs a { margin-left:5px; font-size:12px; color:#6e6c64; }
-  .health { background:#fbfaf4; border:1px solid #e3decf; border-left:3px solid #cc785c;
-            border-radius:10px; padding:14px 16px; margin:18px 0 4px; }
-  .health .score { font-family:Georgia,serif; font-size:32px; font-weight:500;
-                   color:#3d5c2b; line-height:1; vertical-align:middle; }
-  .health .score.warn { color:#8a4a30; }
-  .health .score.bad { color:#8c3527; }
-  .health .score-label { font-size:13px; color:#3d3b35; margin-left:8px;
-                         vertical-align:middle; }
-  .health .health-detail { font-size:12px; color:#6e6c64; margin-top:6px; }
-  .health .spark { font-family:"SF Mono",Menlo,Consolas,monospace; font-size:15px;
-                   letter-spacing:2px; color:#8a4a30; margin-top:8px; }
-  .health .spark-cap { font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
-                       font-size:11px; letter-spacing:0; color:#a09b8e; font-style:italic; }
-  .tabs { display:flex; flex-wrap:wrap; gap:6px; margin:10px 0 14px; }
-  .tab { font-family:inherit; font-size:12px; cursor:pointer; padding:6px 11px;
-         border:1px solid #e3decf; border-radius:999px; background:#fbfaf4;
-         color:#827e76; }
-  .tab:hover { border-color:#cbc4ac; }
-  .tab.on { background:#2c2b27; color:#f5f4ed; border-color:#2c2b27; }
-  .tab-n { font-weight:700; }
-  .panel { display:none; }
-  .panel.on { display:block; }
-</style></head>
-<body><div class="wrap">
-  <h1>RS watch — issues</h1>
-  <div class="sub">${runLine}</div>
-  ${healthBlock}
-
-  <h2>Active clusters (${active.length})</h2>
-  ${
-    active.length
-      ? `<div class="tabs">${tabs
-          .map(
-            (t, idx) =>
-              `<button class="tab${idx === activeTabIdx ? " on" : ""}" data-tab="${idx}">${esc(t.label)} <span class="tab-n">${t.clusters.length}</span></button>`,
-          )
-          .join("")}</div>
-  ${tabs
-    .map(
-      (t, idx) =>
-        `<div class="panel${idx === activeTabIdx ? " on" : ""}" data-panel="${idx}">${
-          t.clusters.length
-            ? t.clusters.map(clusterCard).join("")
-            : '<p class="empty">No active clusters in this category.</p>'
-        }</div>`,
-    )
-    .join("")}`
-      : '<p class="empty">No active clusters.</p>'
+  if (f.q) {
+    const q = f.q.toLowerCase();
+    const issueMatch = new Set(
+      issues
+        .filter(
+          (i) =>
+            (i.kind && i.kind.toLowerCase().includes(q)) ||
+            (i.summary && i.summary.toLowerCase().includes(q)),
+        )
+        .map((i) => String(i.cluster_id)),
+    );
+    list = list.filter(
+      (c) =>
+        (c.slug && c.slug.toLowerCase().includes(q)) ||
+        (c.description && c.description.toLowerCase().includes(q)) ||
+        issueMatch.has(String(c.id)),
+    );
   }
-  ${
-    unclustered.length
-      ? `<h2>Unclustered issues (${unclustered.length})</h2>
-  <div class="card"><ul class="issues">${unclustered
-    .sort(bySeverity)
-    .map(issueRow)
-    .join("")}</ul></div>`
-      : ""
-  }
-  <h2>Resolved clusters (${resolved.length})</h2>
-  ${
-    resolved.length
-      ? `<div class="card"><ul class="issues">${resolved
-          .map(
-            (c) =>
-              `<li><b>${esc(c.slug)}</b> <span class="muted">resolved ${fmtTime(c.resolved_at)}</span></li>`,
-          )
-          .join("")}</ul></div>`
-      : '<p class="empty">None.</p>'
-  }
-</div>
-<script>
-(function () {
-  var tabs = document.querySelectorAll(".tab");
-  var panels = document.querySelectorAll(".panel");
-  tabs.forEach(function (btn) {
-    btn.addEventListener("click", function () {
-      var i = btn.getAttribute("data-tab");
-      tabs.forEach(function (b) {
-        b.classList.toggle("on", b.getAttribute("data-tab") === i);
-      });
-      panels.forEach(function (p) {
-        p.classList.toggle("on", p.getAttribute("data-panel") === i);
-      });
-    });
-  });
-})();
-</script>
-</body></html>`;
+  return list;
 }
+
+function sortClusters(list, sort) {
+  const arr = list.slice();
+  const num = (v) => Number(v || 0);
+  switch (sort) {
+    case "slug":
+      arr.sort((a, b) => a.slug.localeCompare(b.slug));
+      break;
+    case "category":
+      arr.sort((a, b) =>
+        String(a.category || "").localeCompare(String(b.category || "")),
+      );
+      break;
+    case "severity":
+      arr.sort((a, b) => SEV_RANK[a.severity] - SEV_RANK[b.severity]);
+      break;
+    case "status":
+      arr.sort((a, b) => a.status.localeCompare(b.status));
+      break;
+    case "companies":
+      arr.sort((a, b) => num(b.company_count) - num(a.company_count));
+      break;
+    case "streak":
+      arr.sort((a, b) => num(b.streak) - num(a.streak));
+      break;
+    default: // "issues"
+      arr.sort((a, b) => num(b.issue_count) - num(a.issue_count));
+  }
+  return arr;
+}
+
+// ---- app -------------------------------------------------------------------
 
 const app = express();
 app.use(express.json({ limit: "4mb" }));
+app.use(express.urlencoded({ extended: false }));
 
 app.get("/healthz", (_req, res) => res.send("ok"));
 
@@ -600,7 +374,7 @@ async function handleMcp(req, res) {
   }
 }
 
-app.all("/mcp", (req, res, next) => {
+app.all("/mcp", (req, res) => {
   if (req.headers.authorization !== `Bearer ${AUTH_TOKEN}`) {
     return res.status(401).json({ error: "unauthorized" });
   }
@@ -614,32 +388,311 @@ app.all("/t/:token/mcp", (req, res) => {
   return handleMcp(req, res);
 });
 
+// ---- dashboard routes ------------------------------------------------------
+
+const html = (res, body) => {
+  res.set("Content-Type", "text/html; charset=utf-8");
+  res.send(body);
+};
+
 app.get("/dashboard", async (req, res) => {
-  if (req.query.token !== AUTH_TOKEN) {
-    return res.status(401).send("unauthorized");
-  }
-  if (!statePool) {
-    return res.status(503).send("STATE_DATABASE_URL is not configured");
-  }
+  const token = dashAuth(req, res);
+  if (!token) return;
   try {
-    const [clusters, issues, runs, cwRuns] = await Promise.all([
+    const rail = await loadRail();
+    const filters = parseFilters(req.query);
+    const [vclusters, vissues, cwRuns, snaps] = await Promise.all([
       statePool.query("SELECT * FROM v_clusters"),
       statePool.query("SELECT * FROM v_issues"),
-      statePool.query(
-        "SELECT layer, MAX(started_at) AS last_run FROM runs WHERE status = 'succeeded' GROUP BY layer",
-      ),
       statePool.query(
         `SELECT started_at, stats FROM runs
           WHERE layer = 'conversation-watch' AND status = 'succeeded'
             AND started_at > now() - interval '7 days'
           ORDER BY started_at DESC`,
       ),
+      statePool.query(
+        `SELECT cluster_id, issue_count, captured_at FROM cluster_snapshots
+          WHERE captured_at > now() - interval '14 days'
+          ORDER BY cluster_id, captured_at`,
+      ),
     ]);
-    res.set("Content-Type", "text/html; charset=utf-8");
-    res.send(
-      renderDashboard(clusters.rows, issues.rows, runs.rows, cwRuns.rows),
+
+    const snapshotSeries = {};
+    for (const s of snaps.rows) {
+      const k = String(s.cluster_id);
+      (snapshotSeries[k] = snapshotSeries[k] || []).push(
+        Number(s.issue_count),
+      );
+    }
+
+    const filtered = filterClusters(vclusters.rows, vissues.rows, filters);
+    const active = sortClusters(
+      filtered.filter((c) => c.status !== "resolved"),
+      filters.sort,
+    );
+    const resolved = filtered.filter((c) => c.status === "resolved");
+
+    html(
+      res,
+      renderDashboard({
+        token,
+        clusters: active,
+        resolved,
+        cwRuns: cwRuns.rows,
+        snapshotSeries,
+        categoryCounts: rail.categoryCounts,
+        totalClusters: rail.totalClusters,
+        filters,
+      }),
     );
   } catch (err) {
+    res.status(500).send(`error: ${esc(err.message)}`);
+  }
+});
+
+app.get("/cluster/:id", async (req, res) => {
+  const token = dashAuth(req, res);
+  if (!token) return;
+  try {
+    const rail = await loadRail();
+    const cluster = await statePool.query(
+      "SELECT * FROM v_clusters WHERE id = $1",
+      [req.params.id],
+    );
+    if (!cluster.rows.length) {
+      return html(
+        res.status(404),
+        renderNotFound({
+          token,
+          what: "No cluster with that id.",
+          categoryCounts: rail.categoryCounts,
+          totalClusters: rail.totalClusters,
+        }),
+      );
+    }
+    const [issues, snapshots] = await Promise.all([
+      statePool.query("SELECT * FROM v_issues WHERE cluster_id = $1", [
+        req.params.id,
+      ]),
+      statePool.query(
+        `SELECT * FROM cluster_snapshots WHERE cluster_id = $1
+          ORDER BY captured_at DESC LIMIT 14`,
+        [req.params.id],
+      ),
+    ]);
+    const sorted = issues.rows
+      .slice()
+      .sort((a, b) => SEV_RANK[a.severity] - SEV_RANK[b.severity]);
+    html(
+      res,
+      renderCluster({
+        token,
+        cluster: cluster.rows[0],
+        issues: sorted,
+        snapshots: snapshots.rows,
+        categoryCounts: rail.categoryCounts,
+        totalClusters: rail.totalClusters,
+      }),
+    );
+  } catch (err) {
+    res.status(500).send(`error: ${esc(err.message)}`);
+  }
+});
+
+app.get("/company/:slug", async (req, res) => {
+  const token = dashAuth(req, res);
+  if (!token) return;
+  try {
+    const rail = await loadRail();
+    const company = await statePool.query(
+      "SELECT id, slug, name, admin_id FROM companies WHERE slug = $1",
+      [req.params.slug],
+    );
+    if (!company.rows.length) {
+      return html(
+        res.status(404),
+        renderNotFound({
+          token,
+          what: "No company with that slug.",
+          categoryCounts: rail.categoryCounts,
+          totalClusters: rail.totalClusters,
+        }),
+      );
+    }
+    const issues = await statePool.query(
+      "SELECT * FROM v_issues WHERE company_slug = $1",
+      [req.params.slug],
+    );
+    html(
+      res,
+      renderCompany({
+        token,
+        company: company.rows[0],
+        issues: issues.rows,
+        clusterMeta: rail.clusterMeta,
+        categoryCounts: rail.categoryCounts,
+        totalClusters: rail.totalClusters,
+      }),
+    );
+  } catch (err) {
+    res.status(500).send(`error: ${esc(err.message)}`);
+  }
+});
+
+app.get("/issue/new", async (req, res) => {
+  const token = dashAuth(req, res);
+  if (!token) return;
+  try {
+    const rail = await loadRail();
+    const companies = await statePool.query(
+      "SELECT slug, name FROM companies ORDER BY name",
+    );
+    html(
+      res,
+      renderNewIssueForm({
+        token,
+        companies: companies.rows,
+        categoryCounts: rail.categoryCounts,
+        totalClusters: rail.totalClusters,
+      }),
+    );
+  } catch (err) {
+    res.status(500).send(`error: ${esc(err.message)}`);
+  }
+});
+
+app.get("/issue/:id", async (req, res) => {
+  const token = dashAuth(req, res);
+  if (!token) return;
+  try {
+    const rail = await loadRail();
+    const issue = await statePool.query(
+      "SELECT * FROM v_issues WHERE id = $1",
+      [req.params.id],
+    );
+    if (!issue.rows.length) {
+      return html(
+        res.status(404),
+        renderNotFound({
+          token,
+          what: "No issue with that id.",
+          categoryCounts: rail.categoryCounts,
+          totalClusters: rail.totalClusters,
+        }),
+      );
+    }
+    html(
+      res,
+      renderIssue({
+        token,
+        issue: issue.rows[0],
+        categoryCounts: rail.categoryCounts,
+        totalClusters: rail.totalClusters,
+      }),
+    );
+  } catch (err) {
+    res.status(500).send(`error: ${esc(err.message)}`);
+  }
+});
+
+// ---- operator write routes -------------------------------------------------
+
+const tokenQs = (token) => `?token=${encodeURIComponent(token)}`;
+
+app.post("/issue/:id/dismiss", async (req, res) => {
+  const token = dashAuth(req, res);
+  if (!token) return;
+  try {
+    await statePool.query(
+      "UPDATE issues SET status = 'dismissed' WHERE id = $1",
+      [req.params.id],
+    );
+    res.redirect(`/issue/${req.params.id}${tokenQs(token)}`);
+  } catch (err) {
+    res.status(500).send(`error: ${esc(err.message)}`);
+  }
+});
+
+app.post("/issue/:id/note", async (req, res) => {
+  const token = dashAuth(req, res);
+  if (!token) return;
+  try {
+    const note = (req.body.operator_note || "").trim() || null;
+    await statePool.query(
+      "UPDATE issues SET operator_note = $1 WHERE id = $2",
+      [note, req.params.id],
+    );
+    res.redirect(`/issue/${req.params.id}${tokenQs(token)}`);
+  } catch (err) {
+    res.status(500).send(`error: ${esc(err.message)}`);
+  }
+});
+
+app.post("/issue", async (req, res) => {
+  const token = dashAuth(req, res);
+  if (!token) return;
+
+  const companySlug = (req.body.company || "").trim();
+  const kind = (req.body.kind || "").trim();
+  const summary = (req.body.summary || "").trim();
+  let severity = (req.body.severity || "medium").trim();
+  if (!["low", "medium", "high"].includes(severity)) severity = "medium";
+  const sampleConvs = (req.body.sample_convs || "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+
+  const reshow = async (error, status = 400) => {
+    const rail = await loadRail();
+    const companies = await statePool.query(
+      "SELECT slug, name FROM companies ORDER BY name",
+    );
+    html(
+      res.status(status),
+      renderNewIssueForm({
+        token,
+        companies: companies.rows,
+        categoryCounts: rail.categoryCounts,
+        totalClusters: rail.totalClusters,
+        error,
+        values: { company: companySlug, kind, summary, severity,
+          sample_convs: req.body.sample_convs || "" },
+      }),
+    );
+  };
+
+  try {
+    if (!companySlug || !kind || !summary) {
+      return reshow("Company, kind, and summary are all required.");
+    }
+    const company = await statePool.query(
+      "SELECT id FROM companies WHERE slug = $1",
+      [companySlug],
+    );
+    if (!company.rows.length) {
+      return reshow("That company does not exist in the watch system.");
+    }
+    const inserted = await statePool.query(
+      `INSERT INTO issues
+         (company_id, kind, status, severity, summary, sample_convs, origin)
+       VALUES ($1, $2, 'monitoring', $3, $4, $5::jsonb, 'operator')
+       RETURNING id`,
+      [
+        company.rows[0].id,
+        kind,
+        severity,
+        summary,
+        JSON.stringify(sampleConvs),
+      ],
+    );
+    res.redirect(`/issue/${inserted.rows[0].id}${tokenQs(token)}`);
+  } catch (err) {
+    if (err.code === "23505") {
+      return reshow(
+        `An issue "${kind}" already exists for that company — open it from the dashboard instead.`,
+        409,
+      );
+    }
     res.status(500).send(`error: ${esc(err.message)}`);
   }
 });
