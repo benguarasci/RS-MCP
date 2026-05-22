@@ -3,6 +3,11 @@ primary_region = "sjc"
 
 [build]
 
+# Runs in a temporary machine before each new version goes live, so
+# pending migrations apply automatically on every deploy.
+[deploy]
+  release_command = "node migrate.js"
+
 [http_service]
   internal_port = 8080
   force_https = true
