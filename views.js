@@ -167,7 +167,7 @@ const STYLES = `
   a { color:#8a4a30; text-decoration:none; }
   a:hover { text-decoration:underline; }
   .muted { color:#908b7e; }
-  .app { display:flex; align-items:flex-start; }
+  .app { display:flex; align-items:flex-start; max-width:1200px; margin:0 auto; }
 
   .rail { width:194px; flex:none; background:#efece1; border-right:1px solid #e0dbc9;
           padding:16px 13px; min-height:100vh; position:sticky; top:0; }
