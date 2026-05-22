@@ -167,7 +167,7 @@ const STYLES = `
   a { color:#8a4a30; text-decoration:none; }
   a:hover { text-decoration:underline; }
   .muted { color:#908b7e; }
-  .app { display:flex; align-items:flex-start; max-width:1200px; margin:0 auto; }
+  .app { display:flex; align-items:flex-start; }
 
   .rail { width:194px; flex:none; background:#efece1; border-right:1px solid #e0dbc9;
           padding:16px 13px; min-height:100vh; position:sticky; top:0; }
@@ -193,7 +193,8 @@ const STYLES = `
             border:1px solid #2c2b27; background:#2c2b27; color:#f5f4ed; cursor:pointer; }
   .filters .clear { display:block; text-align:center; font-size:11px; margin-top:6px; }
 
-  .content { flex:1; padding:20px 26px 70px; max-width:1000px; }
+  .content { flex:1; min-width:0; padding:20px 0 70px; }
+  .content-inner { max-width:1000px; margin:0 auto; padding:0 26px; }
   .crumb { font-size:12px; margin-bottom:12px; }
   h1 { font-family:Georgia,serif; font-weight:500; font-size:21px; margin:0 0 3px; }
   h2 { font-family:Georgia,serif; font-style:italic; font-weight:500; font-size:15px;
@@ -355,8 +356,10 @@ function layout({
     </form>
   </aside>
   <main class="content">
+    <div class="content-inner">
     ${breadcrumb ? `<div class="crumb">${breadcrumb}</div>` : ""}
     ${body}
+    </div>
   </main>
 </div></body></html>`;
 }
