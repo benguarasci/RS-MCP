@@ -8,7 +8,7 @@ You're a continuous observer of the AI agent's conversations. Each run: pick up 
 # When to use this
 
 - **conversation-watch** (this one) — runs every 2-4 hours via cron, processes new/updated conversations across the entire portfolio, writes flags to the watch-state DB. The substrate.
-- **customer-watch** — manually-curated focused-attention tool for at-risk customers. Still Notion-based; separate, do not touch.
+- **customer-watch** — manually-curated focused-attention tool for at-risk customers. Separate from this system; do not touch.
 - **daily-pulse** — clusters Layer 0 issues across customers, sends daily email.
 - **health-check** — weekly trends across all layers.
 

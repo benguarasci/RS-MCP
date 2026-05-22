@@ -12,7 +12,7 @@ This is a status view with memory, not a diff. Every active cluster appears in t
 - **conversation-watch** (Layer 0) — runs every 2-4 hours, reads every prospect conversation, writes per-customer issues to the watch-state DB.
 - **daily-pulse** (this one) — runs daily, reads conversation-watch's `issues`, groups them into `clusters`, writes a `cluster_snapshots` history row per cluster, emails a status view with history.
 - **health-check** (Layer 2) — runs weekly, reads the same cluster history plus the underlying issues, writes a longer-form trend email.
-- **customer-watch** — a separate, manually-curated watch over named at-risk customers. Still Notion-based; don't touch it.
+- **customer-watch** — a separate, manually-curated watch over named at-risk customers; out of scope here, don't touch it.
 
 # Required MCP tools
 
@@ -42,8 +42,12 @@ All reads go through `state_query`.
 
 ## 1a. Active issues
 
+Select an explicit, narrow column list — **never `SELECT *`**. `v_issues` carries verbose per-issue text (`notes`, `detection_signal`) that daily-pulse never reads; pulling it for every active issue can overflow the `state_query` output cap, which dumps the result to a file and forces slow recovery round-trips before clustering can even start. The columns below are everything Steps 2-5 actually use.
+
 ```sql
-SELECT * FROM v_issues
+SELECT id, company, company_admin_id, kind, status, severity,
+       summary, sample_convs, attributes, cluster, cluster_id, resolved_at
+FROM v_issues
 WHERE status IN ('open','monitoring')
    OR (status = 'resolved' AND resolved_at > now() - interval '7 days')
 ORDER BY company, kind;
@@ -144,6 +148,22 @@ For each cluster, ask: "If I made one change to the system, would every one of t
 
 **Bias toward "this is already a cluster" over "this is a new cluster."** New clusters should be the exception.
 
+## 2e. Assign each new cluster a category
+
+Every cluster carries a `category` — the failure-mode tier *above* clusters. It groups the clusters into a handful of top-level problem types so the dashboard and reports stay scannable. Assign exactly one category per cluster; when a cluster could fit two, pick the **primary** failure mode.
+
+The seven categories are the only valid values — the `issue_category` DB domain rejects anything else:
+
+- **`fabrication`** — the AI states content with no backing data: invented prices, links, specs, names, or policies.
+- **`stale-or-wrong-data`** — data existed but was outdated or mismatched, or the wrong record / listing / unit was selected.
+- **`unbacked-action-claims`** — the AI claims an action is complete, or promises an outcome, with no successful tool call behind it.
+- **`tool-and-pipeline-failures`** — a tool errored, failed silently, raced, or double-fired.
+- **`context-and-identity-loss`** — the AI forgot known information or mixed up prospect / conversation records.
+- **`dropped-or-blocked-conversations`** — the AI went silent, stalled, or never replied.
+- **`policy-and-safety-violations`** — a boundary, disclosure rule, or funnel rule was crossed; internal content leaked.
+
+`category` is **stable** — set once when the cluster is created, like `description` and `fix_rationale`. Existing clusters already have one (from `v_clusters` in Step 1b); never overwrite it. Only brand-new clusters need a category assigned this run.
+
 # Step 3 — Update cluster state and write back
 
 For each cluster (existing or new), compute:
@@ -171,41 +191,66 @@ If a member issue is `dismissed` or `resolved` this run, it's no longer part of 
 
 ## 3a. Write the clusters
 
-Upsert each cluster by `slug`. `description` and `fix_rationale` are stable — set on insert, never overwritten:
+Upsert clusters by `slug`. `description`, `fix_rationale`, and `category` are stable — set on insert, never overwritten (the `ON CONFLICT` clause deliberately omits them). **Write every cluster in one multi-row INSERT — not one statement per cluster.** With 30+ clusters, separate statements mean 30+ `state_query` round-trips and are a primary cause of the run exceeding its wall-clock budget.
 
 ```sql
 INSERT INTO clusters (slug, status, severity, streak, inactive_runs,
-                      description, fix_rationale, sample_convs, resolved_at)
-VALUES ('stale-inventory-sync', 'open', 'high', 3, 0,
-        'AI quoting or booking units that have already been filled.',
-        'A single inventory-sync fix would close every issue in this cluster.',
-        '["12345","12350","12361"]'::jsonb, NULL)
+                      description, fix_rationale, category, sample_convs, resolved_at)
+VALUES
+  ('stale-inventory-sync', 'open', 'high', 3, 0,
+   'AI quoting or booking units that have already been filled.',
+   'A single inventory-sync fix would close every issue in this cluster.',
+   'stale-or-wrong-data', '["12345","12350","12361"]'::jsonb, NULL),
+  ('off-hours-misconfig', 'open', 'high', 1, 0,
+   'Off-hours response suppression firing during business hours.',
+   'One fix to the off-hours rule closes the issue.',
+   'dropped-or-blocked-conversations', '["13001"]'::jsonb, NULL)
+  -- ...one row per cluster, all in this single statement
 ON CONFLICT (slug) DO UPDATE SET
   status = excluded.status, severity = excluded.severity,
   streak = excluded.streak, inactive_runs = excluded.inactive_runs,
   sample_convs = excluded.sample_convs, resolved_at = excluded.resolved_at;
 ```
 
+`category` is one of the seven failure-mode values from Step 2e. New clusters set it here; for an existing cluster the `ON CONFLICT` path leaves the original value untouched.
+
 ## 3b. Reassign issues to clusters
 
+Reassign every issue in one statement — map `(issue_id, cluster_slug)` pairs through a `VALUES` list, not one UPDATE per cluster:
+
 ```sql
-UPDATE issues SET cluster_id = (SELECT id FROM clusters WHERE slug = 'stale-inventory-sync')
-WHERE id IN (42, 43, 51);
+UPDATE issues AS i
+SET cluster_id = c.id
+FROM (VALUES
+  (42, 'stale-inventory-sync'),
+  (43, 'stale-inventory-sync'),
+  (51, 'off-hours-misconfig')
+  -- ...one row per (issue_id, cluster_slug)
+) AS m(issue_id, slug)
+JOIN clusters c ON c.slug = m.slug
+WHERE i.id = m.issue_id;
 ```
 
-For an issue that left every cluster this run: `UPDATE issues SET cluster_id = NULL WHERE id IN (...)`.
+For issues that left every cluster this run, one statement clears them all: `UPDATE issues SET cluster_id = NULL WHERE id IN (...)`.
 
 ## 3c. Write a snapshot per cluster
 
-One `cluster_snapshots` row per cluster per run — this is the canonical history:
+One `cluster_snapshots` row per cluster per run — this is the canonical history. **Insert them all in one statement**, joining a `VALUES` list to `clusters` by `slug` to resolve each `cluster_id`:
 
 ```sql
 INSERT INTO cluster_snapshots (cluster_id, run_id, status, severity, streak,
                                company_count, issue_count, companies, note)
-SELECT id, <run_id>, 'open', 'high', 3, 6, 8,
-       '["Briarlane","Kelson","Mosaic","Prospero","Townline"]'::jsonb,
-       '+Mosaic this run, streak 3'
-FROM clusters WHERE slug = 'stale-inventory-sync';
+SELECT c.id, <run_id>, s.status, s.severity, s.streak,
+       s.company_count, s.issue_count, s.companies, s.note
+FROM (VALUES
+  ('stale-inventory-sync', 'open'::text, 'high'::text, 3, 6, 8,
+   '["Briarlane","Kelson","Mosaic","Prospero","Townline"]'::jsonb,
+   '+Mosaic this run, streak 3'::text),
+  ('off-hours-misconfig', 'open', 'high', 1, 1, 1,
+   '["Sanpra"]'::jsonb, 'NEW today')
+  -- ...one row per cluster
+) AS s(slug, status, severity, streak, company_count, issue_count, companies, note)
+JOIN clusters c ON c.slug = s.slug;
 ```
 
 The `note` is the one-line history annotation (see "How to write the history annotation"). The `companies` jsonb is the frozen customer list — next run diffs against it to compute "+X / −Y".
@@ -231,7 +276,7 @@ Examples:
 
 1. **Health score** — the conversation-health block, rendered above the topline. Shows today's clean rate as a large percentage, a detail line, and a 7-day sparkline. See "How to render the health block" below. If there is no ledger data (Step 1e), render the no-data fallback instead.
 2. **Topline** — total active clusters, total active issues, total customers affected, any HIGH ALERT items called out
-3. **Active clusters** — every cluster whose pill is `MONITORING`, `OPEN`, or `HIGH ALERT`. Each one shows: name, current customer count, current issue count, status pill, history annotation (NEW / +X / -Y / steady / growing / shrinking), one-sentence description, list of currently-affected customers.
+3. **Active clusters** — every cluster whose pill is `MONITORING`, `OPEN`, or `HIGH ALERT`, **grouped under failure-mode category subheadings** (Step 2e's seven categories). Each cluster shows: name, current customer count, current issue count, status pill, history annotation (NEW / +X / -Y / steady / growing / shrinking), one-sentence description, and the list of currently-affected customers — each customer name followed by deep-links to the specific conversations where the issue fired.
 4. **Resolved since last run** — any cluster that flipped to `resolved` this run. One line each. Disappears after one appearance.
 5. **Footer** — generation time, source
 
@@ -270,12 +315,16 @@ Algorithm:
 
 ## Ordering
 
-Within Active clusters, sort by:
+Active clusters are grouped under category subheadings. Order the category sections this way — skip any category with no active clusters:
+
+Fabrication · Stale / wrong data · Unbacked claims · Tool & pipeline · Context & identity · Dropped / blocked · Policy & safety · Uncategorized
+
+Within each category section, sort clusters by:
 
 1. Pill (HIGH ALERT, then OPEN, then MONITORING)
 2. Within that, NEW-today clusters first, then clusters that changed this run (grew or shrank), then steady clusters
 
-No numeric prominence score. Just severity + recency-of-change.
+No numeric prominence score. Just category, then severity + recency-of-change. A cluster whose `category` is null or unrecognized falls under the **Uncategorized** subheading.
 
 ## CSS template
 
@@ -374,6 +423,22 @@ No numeric prominence score. Just severity + recency-of-change.
     font-weight: 500;
     margin: 28px 0 10px;
     color: #1f1e1c;
+  }
+  h3.cat {
+    font-size: 11px;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    font-weight: 600;
+    color: #827e76;
+    margin: 22px 0 4px;
+  }
+  .convs {
+    font-size: 12px;
+  }
+  .convs a {
+    border-bottom: none;
+    margin-left: 5px;
+    color: #6e6c64;
   }
   .cluster {
     background: #fbfaf4;
@@ -496,6 +561,8 @@ Cluster card (one per active cluster):
 ```html
 <h2 class="section">Active clusters</h2>
 
+<h3 class="cat">Stale / wrong data</h3>
+
 <div class="cluster">
   <span class="cluster-name">stale-inventory-sync</span>
   <p class="meta">
@@ -505,24 +572,12 @@ Cluster card (one per active cluster):
   </p>
   <p class="desc">AI quoting or booking units that have already been filled. One inventory-sync fix would close all issues in this cluster.</p>
   <p class="customers">
-    <a href="https://www.rentsimple.ai/admin/companies/76">Briarlane</a>,
-    <a href="https://www.rentsimple.ai/admin/companies/12">Kelson</a>,
-    <a href="https://www.rentsimple.ai/admin/companies/22">Mosaic</a>,
-    <a href="https://www.rentsimple.ai/admin/companies/27">Prospero (×3)</a>,
-    <a href="https://www.rentsimple.ai/admin/companies/57">Townline</a>
-  </p>
-</div>
-
-<div class="cluster">
-  <span class="cluster-name">off-hours-misconfig</span>
-  <p class="meta">
-    <span class="status-pill high-alert">HIGH ALERT</span>
-    1 customer · 1 issue ·
-    <span class="change new">NEW today</span>
-  </p>
-  <p class="desc">Off-hours response suppression is firing during normal business hours. Single fix to the off-hours rule closes the issue.</p>
-  <p class="customers">
-    <a href="https://www.rentsimple.ai/admin/companies/4">Sanpra</a> (8 conversations affected today)
+    <a href="https://www.rentsimple.ai/admin/companies/76">Briarlane</a>
+    <span class="convs"><a href="https://www.rentsimple.ai/admin/conversations?conversationId=12345">#12345</a> <a href="https://www.rentsimple.ai/admin/conversations?conversationId=12350">#12350</a></span>;
+    <a href="https://www.rentsimple.ai/admin/companies/12">Kelson</a>
+    <span class="convs"><a href="https://www.rentsimple.ai/admin/conversations?conversationId=12361">#12361</a></span>;
+    <a href="https://www.rentsimple.ai/admin/companies/22">Mosaic</a>
+    <span class="convs"><a href="https://www.rentsimple.ai/admin/conversations?conversationId=12380">#12380</a></span>
   </p>
 </div>
 
@@ -535,9 +590,26 @@ Cluster card (one per active cluster):
   </p>
   <p class="desc">AI confirming the wrong bedroom or bath count. Likely a prompt/template fix.</p>
   <p class="customers">
-    <a href="https://www.rentsimple.ai/admin/companies/76">Briarlane</a>,
-    <a href="https://www.rentsimple.ai/admin/companies/22">Mosaic</a>,
+    <a href="https://www.rentsimple.ai/admin/companies/76">Briarlane</a>
+    <span class="convs"><a href="https://www.rentsimple.ai/admin/conversations?conversationId=12410">#12410</a></span>;
     <a href="https://www.rentsimple.ai/admin/companies/57">Townline</a>
+    <span class="convs"><a href="https://www.rentsimple.ai/admin/conversations?conversationId=12433">#12433</a></span>
+  </p>
+</div>
+
+<h3 class="cat">Dropped / blocked</h3>
+
+<div class="cluster">
+  <span class="cluster-name">off-hours-misconfig</span>
+  <p class="meta">
+    <span class="status-pill high-alert">HIGH ALERT</span>
+    1 customer · 1 issue ·
+    <span class="change new">NEW today</span>
+  </p>
+  <p class="desc">Off-hours response suppression is firing during normal business hours. Single fix to the off-hours rule closes the issue.</p>
+  <p class="customers">
+    <a href="https://www.rentsimple.ai/admin/companies/4">Sanpra</a>
+    <span class="convs"><a href="https://www.rentsimple.ai/admin/conversations?conversationId=13001">#13001</a></span>
   </p>
 </div>
 ```
@@ -588,6 +660,16 @@ Pick the single most informative descriptor for that cluster's recent trajectory
 
 Customer names link to admin: `<a href="https://www.rentsimple.ai/admin/companies/{admin_id}">Name</a>`. The `admin_id` is on each issue row from `v_issues` (`company_admin_id`). Use `$APP_BASE_URL` if set; default `https://www.rentsimple.ai`.
 
+## Conversation links
+
+After each customer name, link the specific conversations where that customer's issue(s) fired. The conversation IDs come from each issue's `sample_convs` array (selected in Step 1a). When a customer has more than one issue in the cluster, pool all of their `sample_convs` IDs.
+
+Each ID becomes a deep-link to the admin conversation viewer:
+
+`<a href="{APP_BASE}/admin/conversations?conversationId={id}">#{id}</a>`
+
+Wrap a customer's conversation links in a `<span class="convs">…</span>` immediately after their company link, as in the cluster-card skeleton. If an issue has an empty `sample_convs`, just render the customer name with no conversation links.
+
 # Step 5 — Send and close the run
 
 Call `send_email` with `subject` and the HTML body. If the call fails, retry once. If still failing, write full HTML to stdout.
@@ -611,7 +693,7 @@ The `state_query` writeback in Step 3 must happen regardless of email — state 
 - **No emojis.**
 - **No code anchors** or file:line citations — health-check handles that.
 - **Don't merge clusters just because their issues look related.** The merge test is "one fix closes all," not "same area."
-- **`description` / `fix_rationale` are stable** — set once on cluster creation, never overwritten.
+- **`description` / `fix_rationale` / `category` are stable** — set once on cluster creation, never overwritten. Every new cluster must be assigned a `category` — one of the seven failure-mode values in Step 2e.
 - **This skill never writes `issues.status`, `issues.severity`, or any issue field except `cluster_id`.** Issue lifecycle belongs to conversation-watch. daily-pulse only assigns issues to clusters.
 - **`status` writes must be exactly `open`, `monitoring`, or `resolved`; `severity` exactly `low`, `medium`, `high`.** The DB domains reject anything else.
 - **Every resolve requires a rationale** in the cluster's final `cluster_snapshots.note` — trigger rule, last-active date, runs inactive, customer count at last activity. If you can't construct one (e.g. inactive <7 days), do NOT resolve — keep prior status.

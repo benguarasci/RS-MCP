@@ -45,6 +45,8 @@ SELECT * FROM v_issues;
 SELECT * FROM v_clusters;
 ```
 
+`v_clusters` carries each cluster's `category` — the failure-mode tier above clusters, one of seven values: `fabrication`, `stale-or-wrong-data`, `unbacked-action-claims`, `tool-and-pipeline-failures`, `context-and-identity-loss`, `dropped-or-blocked-conversations`, `policy-and-safety-violations`. Use it to roll trends up to the failure-mode level.
+
 ## 1b. Cluster snapshot history
 
 The real trend signal — one row per cluster per daily-pulse run:
@@ -125,6 +127,11 @@ Look across the data for the story of the week.
 - Any `high`-severity issue or cluster
 - A customer with 3+ active issues simultaneously
 
+**Which failure modes dominate?**
+- Group active clusters by `category` and compare per-category issue and company counts against ~7 days ago in the snapshot history
+- Call out any category clearly accumulating — e.g. `fabrication` clusters multiplying, or `tool-and-pipeline-failures` spreading to new customers
+- One category concentrating most of the week's growth is itself a headline
+
 # Step 3 — Compose the email
 
 Clean HTML. Exec-readable in under 2 minutes. Not a firehose — this is the weekly review.
@@ -142,7 +149,7 @@ Examples:
 ## Email structure
 
 1. **Topline numbers** — active issues total, companies affected, issues resolved this week, issues opened this week
-2. **The week in brief** — 3-5 bullet narrative of what actually changed. Concrete, past-tense. Not a status dump.
+2. **The week in brief** — 3-5 bullet narrative of what actually changed. Concrete, past-tense. Not a status dump. When one failure-mode `category` is driving the week's change, name it.
 3. **Needs attention** — issues/clusters that require a decision: high-severity items, stuck long-runners, spreading patterns
 4. **Resolved this week** — what closed, one line each
 5. **Full active issue list** — compact, grouped by company, for reference

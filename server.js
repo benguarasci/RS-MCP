@@ -50,6 +50,9 @@ const mailer =
 
 const INTERNAL_RECIPIENTS = [
   "ben@rentsimple.ai",
+  "tarush@rentsimple.ai",
+  "charlie@rentsimple.ai",
+  "camus@rentsimple.ai",
 ];
 
 function buildMcpServer() {
@@ -228,6 +231,23 @@ function buildMcpServer() {
 
 const SEV_RANK = { high: 0, medium: 1, low: 2 };
 
+// Failure-mode categories — the top tier above clusters. Order here is the
+// tab order on the dashboard. Keys match the issue_category domain in
+// migration 0002. Clusters with a null/unknown category fall into an
+// "Uncategorized" tab appended at runtime.
+const CATEGORIES = [
+  { key: "fabrication", label: "Fabrication" },
+  { key: "stale-or-wrong-data", label: "Stale / wrong data" },
+  { key: "unbacked-action-claims", label: "Unbacked claims" },
+  { key: "tool-and-pipeline-failures", label: "Tool & pipeline" },
+  { key: "context-and-identity-loss", label: "Context & identity" },
+  { key: "dropped-or-blocked-conversations", label: "Dropped / blocked" },
+  { key: "policy-and-safety-violations", label: "Policy & safety" },
+];
+
+// Base URL for admin deep-links (company + conversation pages).
+const APP_BASE_URL = process.env.APP_BASE_URL || "https://www.rentsimple.ai";
+
 function esc(value) {
   return String(value ?? "")
     .replace(/&/g, "&amp;")
@@ -263,11 +283,49 @@ function renderDashboard(clusters, issues, runs) {
     .sort(bySeverity);
   const resolved = clusters.filter((c) => c.status === "resolved");
 
+  // Group active clusters into category tabs. Anything with a null or unknown
+  // category lands in an "Uncategorized" tab appended only when non-empty.
+  const knownKeys = new Set(CATEGORIES.map((c) => c.key));
+  const tabs = CATEGORIES.map((cat) => ({
+    key: cat.key,
+    label: cat.label,
+    clusters: active.filter((c) => c.category === cat.key),
+  }));
+  const uncategorized = active.filter((c) => !knownKeys.has(c.category));
+  if (uncategorized.length) {
+    tabs.push({
+      key: "uncategorized",
+      label: "Uncategorized",
+      clusters: uncategorized,
+    });
+  }
+  // Default to the first tab that actually has clusters.
+  const activeTabIdx = Math.max(
+    0,
+    tabs.findIndex((t) => t.clusters.length),
+  );
+
+  // Render an issue's sample conversations as deep-links to the admin
+  // conversation viewer. sample_convs is a jsonb array of conversation IDs.
+  const convLinks = (convs) => {
+    if (!Array.isArray(convs) || !convs.length) return "";
+    return (
+      ' <span class="convs">' +
+      convs
+        .map(
+          (c) =>
+            `<a href="${APP_BASE_URL}/admin/conversations?conversationId=${encodeURIComponent(c)}">#${esc(c)}</a>`,
+        )
+        .join(" ") +
+      "</span>"
+    );
+  };
+
   const issueRow = (i) => `
         <li>
           <span class="dot sev-${esc(i.severity)}"></span>
           <b>${esc(i.company)}</b> &middot; ${esc(i.kind)}
-          <span class="muted">${esc(i.status)} &middot; streak ${esc(i.streak)}</span>
+          <span class="muted">${esc(i.status)} &middot; streak ${esc(i.streak)}</span>${convLinks(i.sample_convs)}
         </li>`;
 
   const clusterCard = (c) => {
@@ -332,13 +390,44 @@ function renderDashboard(clusters, issues, runs) {
   .dot.sev-medium { background:#cc785c; }
   .dot.sev-low { background:#bdb48f; }
   .empty { color:#827e76; font-style:italic; font-size:14px; }
+  a { color:#8a4a30; text-decoration:none; }
+  a:hover { text-decoration:underline; }
+  .convs a { margin-left:5px; font-size:12px; color:#6e6c64; }
+  .tabs { display:flex; flex-wrap:wrap; gap:6px; margin:10px 0 14px; }
+  .tab { font-family:inherit; font-size:12px; cursor:pointer; padding:6px 11px;
+         border:1px solid #e3decf; border-radius:999px; background:#fbfaf4;
+         color:#827e76; }
+  .tab:hover { border-color:#cbc4ac; }
+  .tab.on { background:#2c2b27; color:#f5f4ed; border-color:#2c2b27; }
+  .tab-n { font-weight:700; }
+  .panel { display:none; }
+  .panel.on { display:block; }
 </style></head>
 <body><div class="wrap">
   <h1>RS watch — issues</h1>
   <div class="sub">${runLine}</div>
 
   <h2>Active clusters (${active.length})</h2>
-  ${active.length ? active.map(clusterCard).join("") : '<p class="empty">No active clusters.</p>'}
+  ${
+    active.length
+      ? `<div class="tabs">${tabs
+          .map(
+            (t, idx) =>
+              `<button class="tab${idx === activeTabIdx ? " on" : ""}" data-tab="${idx}">${esc(t.label)} <span class="tab-n">${t.clusters.length}</span></button>`,
+          )
+          .join("")}</div>
+  ${tabs
+    .map(
+      (t, idx) =>
+        `<div class="panel${idx === activeTabIdx ? " on" : ""}" data-panel="${idx}">${
+          t.clusters.length
+            ? t.clusters.map(clusterCard).join("")
+            : '<p class="empty">No active clusters in this category.</p>'
+        }</div>`,
+    )
+    .join("")}`
+      : '<p class="empty">No active clusters.</p>'
+  }
   ${
     unclustered.length
       ? `<h2>Unclustered issues (${unclustered.length})</h2>
@@ -359,7 +448,25 @@ function renderDashboard(clusters, issues, runs) {
           .join("")}</ul></div>`
       : '<p class="empty">None.</p>'
   }
-</div></body></html>`;
+</div>
+<script>
+(function () {
+  var tabs = document.querySelectorAll(".tab");
+  var panels = document.querySelectorAll(".panel");
+  tabs.forEach(function (btn) {
+    btn.addEventListener("click", function () {
+      var i = btn.getAttribute("data-tab");
+      tabs.forEach(function (b) {
+        b.classList.toggle("on", b.getAttribute("data-tab") === i);
+      });
+      panels.forEach(function (p) {
+        p.classList.toggle("on", p.getAttribute("data-panel") === i);
+      });
+    });
+  });
+})();
+</script>
+</body></html>`;
 }
 
 const app = express();
