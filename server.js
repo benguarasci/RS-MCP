@@ -9,6 +9,7 @@ import {
   SEV_RANK,
   renderDashboard,
   renderCluster,
+  renderCompanies,
   renderCompany,
   renderIssue,
   renderNewIssueForm,
@@ -273,6 +274,84 @@ async function loadRail() {
   return { categoryCounts, totalClusters: rows.length, clusterMeta };
 }
 
+// Per-company aggregates from the watch-state DB — drives the Companies view
+// and the per-company health badge. Cheap: one query, indexed scans.
+async function loadCompanyAggregates() {
+  const { rows } = await statePool.query(`
+    SELECT c.id, c.slug, c.name, c.admin_id,
+      (SELECT count(*)::int FROM issues i WHERE i.company_id = c.id AND i.status = 'open')          AS open_issues,
+      (SELECT count(*)::int FROM issues i WHERE i.company_id = c.id AND i.status = 'monitoring')    AS monitoring_issues,
+      (SELECT count(*)::int FROM issues i WHERE i.company_id = c.id AND i.status IN ('open','monitoring') AND i.severity = 'high') AS high_issues,
+      (SELECT count(*)::int FROM cs_issues i WHERE i.company_id = c.id AND i.status = 'open')       AS cs_open,
+      (SELECT count(*)::int FROM cs_issues i WHERE i.company_id = c.id AND i.status = 'monitoring') AS cs_monitoring,
+      (SELECT count(*)::int FROM cs_issues i WHERE i.company_id = c.id AND i.status IN ('open','monitoring') AND i.severity = 'high') AS cs_high,
+      (SELECT count(*)::int FROM cs_actions a WHERE a.company_id = c.id AND a.status = 'open')      AS open_actions
+    FROM companies c
+    ORDER BY c.name
+  `);
+  return rows;
+}
+
+// Topline activity metrics from the prod DB for a list of admin IDs. One
+// READ ONLY transaction; three grouped queries. Returns map keyed by admin_id.
+// Returns an empty map on prod DB error so the dashboard still renders.
+async function loadTopline(adminIds, windowHours = 24) {
+  const result = new Map();
+  if (!adminIds.length) return result;
+  const win = `${Number(windowHours)} hours`;
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN TRANSACTION READ ONLY");
+    const [conv, tour, prospect] = await Promise.all([
+      client.query(
+        `SELECT "companyId" AS admin_id,
+                count(*)::int AS conversations,
+                (count(*) FILTER (WHERE "adminRating" <= 2))::int AS low_rated
+         FROM "Conversation"
+         WHERE "companyId" = ANY($1::int[])
+           AND "createdAt" > now() - interval '${win}'
+         GROUP BY "companyId"`,
+        [adminIds],
+      ),
+      client.query(
+        `SELECT m."companyId" AS admin_id,
+                (count(*) FILTER (WHERE a."status" IN ('Confirmed','ManagerConfirmed')))::int AS tours_booked,
+                (count(*) FILTER (WHERE a."status" = 'Completed'))::int AS tours_completed,
+                (count(*) FILTER (WHERE a."status" IN ('ManagerCancelled','ProspectCancelled')))::int AS tours_cancelled
+         FROM "Appointment" a
+         JOIN "Manager" m ON m.id = a."managerId"
+         WHERE m."companyId" = ANY($1::int[])
+           AND a."deletedAt" IS NULL
+           AND a."createdAt" > now() - interval '${win}'
+         GROUP BY m."companyId"`,
+        [adminIds],
+      ),
+      client.query(
+        `SELECT "companyId" AS admin_id, count(*)::int AS prospects
+         FROM "Prospect"
+         WHERE "companyId" = ANY($1::int[])
+           AND "createdAt" > now() - interval '${win}'
+         GROUP BY "companyId"`,
+        [adminIds],
+      ),
+    ]);
+    await client.query("COMMIT");
+    const merge = (row) => {
+      const prev = result.get(row.admin_id) || {};
+      result.set(row.admin_id, { ...prev, ...row });
+    };
+    conv.rows.forEach(merge);
+    tour.rows.forEach(merge);
+    prospect.rows.forEach(merge);
+  } catch (err) {
+    try { await client.query("ROLLBACK"); } catch {}
+    console.error("loadTopline failed:", err.message);
+  } finally {
+    client.release();
+  }
+  return result;
+}
+
 function parseFilters(q) {
   return {
     category: q.category || "",
@@ -499,6 +578,31 @@ app.get("/cluster/:id", async (req, res) => {
   }
 });
 
+app.get("/companies", async (req, res) => {
+  const token = dashAuth(req, res);
+  if (!token) return;
+  try {
+    const rail = await loadRail();
+    const companies = await loadCompanyAggregates();
+    const adminIds = companies.map((c) => c.admin_id).filter(Boolean);
+    const topline = await loadTopline(adminIds, 24);
+    html(
+      res,
+      renderCompanies({
+        token,
+        companies,
+        topline,
+        windowHours: 24,
+        categoryCounts: rail.categoryCounts,
+        totalClusters: rail.totalClusters,
+        sort: req.query.sort || "",
+      }),
+    );
+  } catch (err) {
+    res.status(500).send(`error: ${esc(err.message)}`);
+  }
+});
+
 app.get("/company/:slug", async (req, res) => {
   const token = dashAuth(req, res);
   if (!token) return;
@@ -519,16 +623,31 @@ app.get("/company/:slug", async (req, res) => {
         }),
       );
     }
-    const issues = await statePool.query(
-      "SELECT * FROM v_issues WHERE company_slug = $1",
-      [req.params.slug],
-    );
+    const co = company.rows[0];
+    const [issues, csIssues, csActions] = await Promise.all([
+      statePool.query("SELECT * FROM v_issues WHERE company_slug = $1", [co.slug]),
+      statePool.query(
+        "SELECT * FROM v_cs_issues WHERE company_slug = $1 ORDER BY status, severity DESC, last_sighted DESC",
+        [co.slug],
+      ),
+      statePool.query(
+        "SELECT * FROM v_cs_actions WHERE company_slug = $1 AND status = 'open' ORDER BY first_flagged DESC",
+        [co.slug],
+      ),
+    ]);
+    const toplineMap = co.admin_id
+      ? await loadTopline([co.admin_id], 24)
+      : new Map();
     html(
       res,
       renderCompany({
         token,
-        company: company.rows[0],
+        company: co,
         issues: issues.rows,
+        csIssues: csIssues.rows,
+        csActions: csActions.rows,
+        topline: toplineMap.get(co.admin_id) || null,
+        windowHours: 24,
         clusterMeta: rail.clusterMeta,
         categoryCounts: rail.categoryCounts,
         totalClusters: rail.totalClusters,

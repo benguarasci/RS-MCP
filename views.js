@@ -157,6 +157,57 @@ function computeHealth(cwRuns) {
   };
 }
 
+// Composite per-company health label. Transparent rules over visible signals;
+// no synthetic score. Each tier is the worst signal that fired.
+export function companyHealth(c, topline) {
+  const high = (c.high_issues || 0) + (c.cs_high || 0);
+  const open = (c.open_issues || 0) + (c.cs_open || 0);
+  const monitoring = (c.monitoring_issues || 0) + (c.cs_monitoring || 0);
+  const actions = c.open_actions || 0;
+  const conv = topline ? Number(topline.conversations || 0) : 0;
+  const lowRated = topline ? Number(topline.low_rated || 0) : 0;
+  const lowRate = conv > 0 ? lowRated / conv : 0;
+
+  if (high > 0 || actions >= 5 || (conv >= 10 && lowRate >= 0.4)) {
+    return { key: "at-risk", label: "At risk" };
+  }
+  if (open > 0 || actions >= 3 || (conv >= 10 && lowRate >= 0.2)) {
+    return { key: "attention", label: "Attention" };
+  }
+  if (monitoring > 0 || actions > 0) {
+    return { key: "watching", label: "Watching" };
+  }
+  return { key: "healthy", label: "Healthy" };
+}
+
+// Topline strip — renders the prod activity counts from loadTopline. Omits
+// zero counts to keep noise down. Returns "" when there's no admin_id mapping
+// or no row at all (renders no strip rather than a misleading "0 of everything").
+function renderTopline(topline, windowHours) {
+  if (!topline) {
+    return `<div class="topline"><span class="muted">No activity data for this customer.</span><span class="tl-window">last ${windowHours}h</span></div>`;
+  }
+  const items = [
+    ["conversations", "conversations"],
+    ["low_rated", "low-rated"],
+    ["prospects", "new prospects"],
+    ["tours_booked", "tours booked"],
+    ["tours_completed", "tours completed"],
+    ["tours_cancelled", "tours cancelled"],
+  ];
+  const rendered = items
+    .filter(([k]) => Number(topline[k] || 0) > 0)
+    .map(
+      ([k, label]) =>
+        `<span class="tl-item"><span class="tl-num">${esc(topline[k])}</span><span class="tl-lbl">${esc(label)}</span></span>`,
+    )
+    .join("");
+  const body =
+    rendered ||
+    `<span class="muted">No activity in this window.</span>`;
+  return `<div class="topline">${body}<span class="tl-window">last ${windowHours}h</span></div>`;
+}
+
 // ---- stylesheet ------------------------------------------------------------
 
 const STYLES = `
@@ -215,6 +266,21 @@ const STYLES = `
   .p-medium { background:#f0d9cc; color:#8a4a30; }
   .p-low { background:#ede8d8; color:#807548; }
   .p-cat { background:#ece7d6; color:#807548; }
+  .p-action { background:#ecc8c0; color:#8c3527; }
+  .p-action-mild { background:#f0d9cc; color:#8a4a30; }
+  .p-healthy { background:#dfecd5; color:#3d5c2b; }
+  .p-watching { background:#ede8d8; color:#807548; }
+  .p-attention { background:#f0d9cc; color:#8a4a30; }
+  .p-at-risk { background:#ecc8c0; color:#8c3527; }
+  .topline { background:#fbfaf4; border:1px solid #e3decf; border-radius:8px;
+             padding:11px 14px; margin:10px 0 14px; font-size:12px;
+             color:#3d3b35; display:flex; flex-wrap:wrap; gap:14px; }
+  .topline .tl-item { white-space:nowrap; }
+  .topline .tl-num { font-family:Georgia,serif; font-size:16px; color:#1f1e1c;
+                     margin-right:5px; }
+  .topline .tl-lbl { font-size:11px; color:#807548; letter-spacing:.02em; }
+  .topline .tl-window { color:#a09a89; font-style:italic; margin-left:auto;
+                        align-self:center; }
   .dot { display:inline-block; width:7px; height:7px; border-radius:50%;
          margin-right:4px; vertical-align:middle; }
   .s-high { background:#8c3527; }
@@ -339,8 +405,8 @@ function layout({
     <div class="brand">RS watch</div>
     <a class="newbtn" href="${lk("/issue/new")}">+ New issue</a>
     <a class="nav${page === "dashboard" ? " on" : ""}" href="${lk("/dashboard")}">Overview</a>
+    <a class="nav${page === "companies" ? " on" : ""}" href="${lk("/companies")}">Companies</a>
     <span class="nav soon">Trends &middot; soon</span>
-    <span class="nav soon">Companies &middot; soon</span>
     <div class="rail-lbl">Categories</div>
     ${catList}
     <div class="rail-lbl">Filters</div>
@@ -553,12 +619,158 @@ export function renderCluster({
   });
 }
 
+// ---- companies overview ----------------------------------------------------
+
+export function renderCompanies({
+  token,
+  companies,
+  topline,
+  windowHours,
+  categoryCounts,
+  totalClusters,
+  sort,
+}) {
+  const lk = (path, params) => href(token, path, params);
+  const HEALTH_RANK = { "at-risk": 0, attention: 1, watching: 2, healthy: 3 };
+
+  const enriched = companies.map((c) => {
+    const tl = c.admin_id ? topline.get(c.admin_id) : null;
+    return { ...c, topline: tl, health: companyHealth(c, tl) };
+  });
+
+  const num = (v) => Number(v || 0);
+  const sorted = enriched.slice();
+  switch (sort) {
+    case "name":
+      sorted.sort((a, b) => a.name.localeCompare(b.name));
+      break;
+    case "actions":
+      sorted.sort((a, b) => num(b.open_actions) - num(a.open_actions));
+      break;
+    case "issues":
+      sorted.sort(
+        (a, b) =>
+          num(b.open_issues) + num(b.cs_open) - (num(a.open_issues) + num(a.cs_open)),
+      );
+      break;
+    case "conversations":
+      sorted.sort(
+        (a, b) =>
+          num(b.topline && b.topline.conversations) -
+          num(a.topline && a.topline.conversations),
+      );
+      break;
+    default: // health
+      sorted.sort(
+        (a, b) =>
+          HEALTH_RANK[a.health.key] - HEALTH_RANK[b.health.key] ||
+          a.name.localeCompare(b.name),
+      );
+  }
+
+  const sortHead = (col, label) => {
+    const on = (sort || "health") === col;
+    return `<th><a class="${on ? "on" : ""}" href="${lk("/companies", { sort: col })}">${esc(label)}${on ? " ▾" : ""}</a></th>`;
+  };
+
+  const tally = enriched.reduce(
+    (acc, c) => {
+      acc[c.health.key] = (acc[c.health.key] || 0) + 1;
+      return acc;
+    },
+    { healthy: 0, watching: 0, attention: 0, "at-risk": 0 },
+  );
+
+  const summary = `
+    <div class="topline">
+      <span class="tl-item"><span class="tl-num">${tally["at-risk"]}</span><span class="tl-lbl">at risk</span></span>
+      <span class="tl-item"><span class="tl-num">${tally.attention}</span><span class="tl-lbl">attention</span></span>
+      <span class="tl-item"><span class="tl-num">${tally.watching}</span><span class="tl-lbl">watching</span></span>
+      <span class="tl-item"><span class="tl-num">${tally.healthy}</span><span class="tl-lbl">healthy</span></span>
+      <span class="tl-window">activity window: last ${windowHours}h</span>
+    </div>`;
+
+  const row = (c) => {
+    const tl = c.topline || {};
+    const issuesCell =
+      num(c.open_issues) + num(c.cs_open) > 0
+        ? `<b>${num(c.open_issues) + num(c.cs_open)}</b>${
+            num(c.high_issues) + num(c.cs_high) > 0
+              ? ` <span class="muted">(${num(c.high_issues) + num(c.cs_high)} high)</span>`
+              : ""
+          }`
+        : '<span class="muted">—</span>';
+    const monitoringCell =
+      num(c.monitoring_issues) + num(c.cs_monitoring) || '<span class="muted">—</span>';
+    const actionsCell = num(c.open_actions)
+      ? `<b>${num(c.open_actions)}</b>`
+      : '<span class="muted">—</span>';
+    const cvCell = num(tl.conversations)
+      ? `${num(tl.conversations)}${num(tl.low_rated) ? ` <span class="muted">(${num(tl.low_rated)} low)</span>` : ""}`
+      : '<span class="muted">—</span>';
+    const toursCell =
+      num(tl.tours_booked) + num(tl.tours_completed) + num(tl.tours_cancelled)
+        ? `${num(tl.tours_booked) + num(tl.tours_completed)}${num(tl.tours_cancelled) ? ` <span class="muted">(${num(tl.tours_cancelled)} cnx)</span>` : ""}`
+        : '<span class="muted">—</span>';
+    const prospectsCell = num(tl.prospects)
+      ? num(tl.prospects)
+      : '<span class="muted">—</span>';
+    return `
+      <tr class="row" onclick="location='${lk("/company/" + c.slug)}'" style="cursor:pointer">
+        <td><a class="name" href="${lk("/company/" + c.slug)}">${esc(c.name)}</a></td>
+        <td>${pill(c.health.key, c.health.label)}</td>
+        <td>${issuesCell}</td>
+        <td>${monitoringCell}</td>
+        <td>${actionsCell}</td>
+        <td>${cvCell}</td>
+        <td>${toursCell}</td>
+        <td>${prospectsCell}</td>
+      </tr>`;
+  };
+
+  const table = sorted.length
+    ? `<table class="tbl">
+        <tr>
+          ${sortHead("name", "Customer")}
+          ${sortHead("health", "Health")}
+          ${sortHead("issues", "Open issues")}
+          <th>Monitoring</th>
+          ${sortHead("actions", "Actions")}
+          ${sortHead("conversations", "Convs")}
+          <th>Tours</th>
+          <th>Prospects</th>
+        </tr>
+        ${sorted.map(row).join("")}
+      </table>`
+    : `<p class="sub">No companies in the watch system yet.</p>`;
+
+  const body = `
+    <h1>Companies</h1>
+    <p class="sub">Per-customer status with activity from the last ${windowHours}h. Click a row for the full report.</p>
+    ${summary}
+    ${table}`;
+
+  return layout({
+    token,
+    page: "companies",
+    title: "RS watch — companies",
+    categoryCounts,
+    totalClusters,
+    filters: {},
+    body,
+  });
+}
+
 // ---- company detail --------------------------------------------------------
 
 export function renderCompany({
   token,
   company,
   issues,
+  csIssues = [],
+  csActions = [],
+  topline = null,
+  windowHours = 24,
   clusterMeta,
   categoryCounts,
   totalClusters,
@@ -569,7 +781,21 @@ export function renderCompany({
   );
   const highCount = active.filter((i) => i.severity === "high").length;
 
-  // Group active issues by category (via their cluster).
+  // Build a counts shape that companyHealth understands.
+  const cs = {
+    open_issues: issues.filter((i) => i.status === "open").length,
+    monitoring_issues: issues.filter((i) => i.status === "monitoring").length,
+    high_issues: active.filter((i) => i.severity === "high").length,
+    cs_open: csIssues.filter((i) => i.status === "open").length,
+    cs_monitoring: csIssues.filter((i) => i.status === "monitoring").length,
+    cs_high: csIssues
+      .filter((i) => i.status === "open" || i.status === "monitoring")
+      .filter((i) => i.severity === "high").length,
+    open_actions: csActions.length,
+  };
+  const health = companyHealth(cs, topline);
+
+  // Group active conversation-watch issues by category (via their cluster).
   const groups = new Map();
   for (const i of active) {
     const meta = clusterMeta.get(i.cluster_id);
@@ -599,22 +825,78 @@ export function renderCompany({
     )
     .join("");
 
+  const activeCs = csIssues.filter(
+    (i) => i.status === "open" || i.status === "monitoring",
+  );
+  const csIssuesBlock = activeCs.length
+    ? `<h2>Customer-watch issues (${activeCs.length})</h2>
+       <table class="tbl">
+         <tr><th>Kind</th><th>Sev</th><th>Status</th><th>Streak</th><th>Last sighted</th><th>Conversations</th></tr>
+         ${activeCs
+           .map(
+             (i) => `
+           <tr>
+             <td><span class="name">${esc(i.kind)}</span><div class="muted" style="font-size:11px;margin-top:2px">${esc(i.summary || "")}</div></td>
+             <td>${sevDot(i.severity)}${esc(i.severity)}</td>
+             <td>${pill(i.status, i.status)}</td>
+             <td>${esc(i.streak)} / ${esc(i.clean_runs)} clean</td>
+             <td class="muted">${fmtDate(i.last_sighted)}</td>
+             <td>${convLinks(i.sample_convs)}</td>
+           </tr>`,
+           )
+           .join("")}
+       </table>`
+    : "";
+
+  const csActionsBlock = csActions.length
+    ? `<h2>Needs follow-up (${csActions.length})</h2>
+       <p class="sub">One-shot recoveries flagged by customer-watch. Marked open until the operator resolves them.</p>
+       <table class="tbl">
+         <tr><th>Action</th><th>Conversation</th><th>Summary</th><th>Open since</th></tr>
+         ${csActions
+           .map((a) => {
+             const high = ["failed-booking", "wrong-bedroom-or-unit", "frustrated-prospect"].includes(
+               a.action_kind,
+             );
+             return `
+           <tr>
+             <td>${high ? pill("action", a.action_kind) : pill("action-mild", a.action_kind)}</td>
+             <td>${convLinks([a.conversation_id])}</td>
+             <td>${esc(a.summary)}</td>
+             <td class="muted">${fmtDate(a.first_flagged)} · ${ageDays(a.first_flagged)}</td>
+           </tr>`;
+           })
+           .join("")}
+       </table>`
+    : "";
+
   const adminLink = company.admin_id
     ? ` &middot; <a href="${APP_BASE_URL}/admin/companies/${esc(company.admin_id)}">admin ↗</a>`
     : "";
 
   const body = `
     <h1>${esc(company.name)}</h1>
-    <div class="kv">${active.length} active issues &middot; ${highCount} high-severity${adminLink}</div>
-    ${sections || '<p class="sub">No active issues for this customer.</p>'}`;
+    <div style="margin:6px 0 2px">${pill(health.key, health.label)}</div>
+    <div class="kv">${active.length + activeCs.length} active issues &middot; ${highCount + cs.cs_high} high-severity &middot; ${csActions.length} open actions${adminLink}</div>
+    ${renderTopline(topline, windowHours)}
+    ${csActionsBlock}
+    ${csIssuesBlock}
+    ${
+      sections ||
+      (activeCs.length || csActions.length
+        ? ""
+        : '<p class="sub">No active issues for this customer.</p>')
+    }
+    ${sections ? `<h2>Portfolio-wide issues</h2>${sections}` : ""}`;
 
   return layout({
     token,
+    page: "companies",
     title: `company — ${company.name}`,
     categoryCounts,
     totalClusters,
     filters: {},
-    breadcrumb: `<a href="${lk("/dashboard")}">← Overview</a> / ${esc(company.name)}`,
+    breadcrumb: `<a href="${lk("/companies")}">← Companies</a> / ${esc(company.name)}`,
     body,
   });
 }
