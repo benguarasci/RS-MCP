@@ -1,92 +1,92 @@
 ---
-description: Scans data since the last run for a small named list of customers and reports which known issues are still firing, with example conversation IDs. Also surfaces any new patterns noticed in the conversations. Doesn't propose fixes — just shows what's happening. Runs as often as you want; state keyed off the last run, not the calendar.
-argument-hint: comma-separated company IDs to watch (required), then optional comma-separated email recipients
+description: Scans data since the last run for a small named list of customers and reports which known issues are still firing, with example conversation IDs. Also surfaces any new patterns noticed in the conversations. Doesn't propose fixes — just shows what's happening. Runs as often as you want; state lives in the watch-state Postgres DB (cs_issues) and the window is keyed off the last succeeded run.
+argument-hint: comma-separated company admin IDs to watch (required), then optional comma-separated email recipients
 ---
 
-You're the operator's daily scan. For each watched customer: check whether each known issue is still happening, give example conv IDs, and flag anything new you noticed in the data. Don't propose fixes. Don't recommend tickets. Just report what's there.
+You're the operator's per-customer scan. For each watched customer: check whether each known issue is still firing, give example conv IDs, and flag anything new you noticed in the data. Don't propose fixes. Don't recommend tickets. Just report what's there.
 
 # When to use this
 
-- **daily-pulse** — Tue–Fri portfolio sweep, AI failure patterns across all customers
-- **customer-watch** (this one) — per-run scan of a fixed list of customers, known-issue updates + new pattern detection
-- **health-check** — weekly, full report
+- **conversation-watch** (Layer 0) — portfolio-wide every-few-hours sweep, writes to `issues`
+- **daily-pulse** — daily cluster brief
+- **customer-watch** (this one) — per-run scan of a fixed list of customers, reads/writes `cs_issues`
+- **health-check** — weekly trend report
 
 # Required MCP tools
 
-- Postgres MCP (read-only DB)
-- RS-DB MCP `send_email`
-- Notion MCP `notion-query-database-view` (primary lookup, Step 1), `notion-fetch` (body reads), `notion-search` (fallback only), `notion-update-page` + `notion-create-pages` (writeback) on `Self learning db` (`collection://35f9fe3f-af42-80ba-bf81-000b602adf12`)
+Both tools are on the `rs-neon-mcp` server:
 
-If Postgres or RS-DB email is missing, stop and report. If Notion is missing, send the email anyway and skip the writeback, note "(Notion unavailable this run)".
+- **`query`** — read-only SQL against the prod Postgres DB (conversation data).
+- **`state_query`** — read/write SQL against the watch-state Postgres DB (`cs_issues`, `companies`, `runs`).
+- **`send_email`** — sends the per-run brief.
+
+If `query` or `state_query` is missing, stop and report. If `send_email` is missing, write the HTML to stdout but still do the `state_query` writeback.
+
+# The state database
+
+Customer-watch maintains its own per-issue table, isolated from conversation-watch:
+
+- **`cs_issues`** — one row per `(company_id, kind)` watched by this skill. Recurring patterns.
+- **`cs_actions`** — one row per `(conversation_id, action_kind)`. One-shot recoveries the operator should personally take on a specific prospect / conversation. Distinct from `cs_issues`: patterns vs. concrete action items.
+- **`companies`** — shared with the other watch skills; upserted as new watched customers are seen.
+- **`runs`** — shared; this skill logs its own run as `layer = 'customer-watch'`.
+
+It **never** writes `issues`, `clusters`, or `cluster_snapshots` — those belong to conversation-watch / daily-pulse. Read denormalized state from the `v_cs_issues` and `v_cs_actions` views; write to `cs_issues` and `cs_actions`. All of this goes through `state_query`.
+
+Status / severity model (same domain values as the rest of the watch system):
+
+- **`status`**: `monitoring` → `open` → `resolved`; `dismissed` is terminal (the old Notion "NON ISSUE").
+- **`severity`**: `low` / `medium` / `high` (the old Notion "HIGH ALERT" is `severity = high`).
+- **`streak`**: consecutive runs the issue was sighted (matches conversation-watch's convention).
+- **`clean_runs`**: consecutive runs with no sighting since the issue was last sighted.
 
 # Configuration
 
-- **Watched companies**: first arg — comma-separated numeric company IDs, e.g. `22,57,76`. Required. If not provided, stop and ask.
+- **Watched companies**: first arg — comma-separated prod `Company.id` admin IDs, e.g. `22,57,76`. Required. If not provided, stop and ask.
 - **Email recipients**: second arg, else env `$HEALTH_CHECK_RECIPIENTS`, else ask once.
 
-# Step 1 — Read Notion known issues
+# Step 0 — Open the run
 
-**This step uses a deterministic view query, not semantic search.** `notion-search` is unreliable for exact-title lookup because results are ranked and capped at 25 — the exact-named row can fall outside the top 25 and cause Step 7 to either skip the update or create a duplicate. The view query returns every Customer-type row in a defined order, paginated reliably.
+```sql
+INSERT INTO runs (layer, status) VALUES ('customer-watch', 'running') RETURNING id;
+```
 
-## 1a. Query the lookup view
+If the skill fails partway, the row stays `running` — that's the signal it never completed. The window query in Step 2 only counts `succeeded` runs, so this open row never corrupts the next window.
 
-Call `notion-query-database-view` once:
+# Step 1 — Load known issues for the watched customers
 
-- `view_url: https://www.notion.so/rentsimple/35f9fe3faf4280c69197f5c4d390650a?v=3609fe3faf428049bc99000cd69e28a3`
+Resolve the watched admin IDs to company rows first (upsert if missing — see Step 6a). Then load every `cs_issues` row for those companies via the view:
 
-This view is pre-configured to filter `Type = Customer` and sort by `Run date` desc. The result is the full list of customer-watch rows across all customers — no ranking, no cap.
+```sql
+SELECT * FROM v_cs_issues
+WHERE company_admin_id IN (22, 57, 76)
+ORDER BY company, kind;
+```
 
-If the call returns paginated results (more rows than fit in one page), iterate through all pages until exhausted. Don't stop at the first page.
+This is your **known-issues map** for the run, keyed by `(company_admin_id, kind)`. The `detection_signal` field is the mechanical pattern you evaluate this run's conversations against.
 
-If the view query fails entirely, fall back to `notion-search` with `data_source_url: collection://35f9fe3f-af42-80ba-bf81-000b602adf12` and exhaust pagination. Note "(view query failed, fell back to search)" in chat report-back so the operator can investigate.
+**Dismissed issues stay in the map.** A row with `status = 'dismissed'` was marked a non-issue by the operator. Keep it in the map so a re-detection of the same `(company, kind)` *matches* it and is then left alone — never reopen it, and never let a dismissed pattern be re-inserted as a "new" pattern in Step 4.
 
-## 1b. Filter to watched customers' rows
+**`origin = 'operator'` issues are first-class watch targets.** The operator added them by hand to a customer's watch list. Evaluate conversations against them every run, exactly like watcher-detected issues. An operator issue may have no `detection_signal` — fall back to `summary` as the pattern to look for.
 
-From the returned rows, keep only those whose `Name` matches one of these patterns for a watched company slug (case-sensitive, exact):
+**Read `operator_note`.** If an issue carries an `operator_note`, that is the operator's commentary for this run — context, what to ignore, what to look at harder. Factor it into your judgment for that `(company, kind)`. It is operator-owned: read it, never overwrite or clear it.
 
-- `cs-{slug}` → summary row
-- `cs-{slug}-{issue-slug}` → per-issue row
-
-Ignore any row whose Name doesn't match a pattern exactly for a watched customer. Other customers' rows in the view are not relevant to this run.
-
-## 1c. Deduplicate by exact Name
-
-For each exact Name with 2+ rows (duplicates from past runs), keep the most recent by `Run date` (ties: createdTime) as canonical. Surface duplicate counts in chat report-back so the operator can clean up manually.
-
-Final maps:
-
-- `summary[company] → {page_id, properties, body}` — exact-Name `cs-{slug}`
-- `issues[company] → {exact_name → {page_id, properties, body}}` — exact-Name `cs-{slug}-{issue-slug}`
-
-`notion-fetch` each canonical per-issue row's body to extract:
-
-- **Detection signal** — how to detect the issue mechanically
-- **Status** — `OPEN`, `QUIET`, `RESOLVED`, or `NON ISSUE`
-
-## 1d. Filter NON ISSUE
-
-For each canonical Name, check its `Status`. If `NON ISSUE`, drop that Name entirely — no signal check, no mention in email, no writeback. Count distinct dropped Names for chat report-back. Most recent verdict per Name wins.
-
-## 1e. Hard precondition for Step 7
-
-Before any writeback runs: the Step 1 maps must exist. If Step 1 returned zero rows total across all watched customers AND the view query did not fail, that's a real state — proceed normally (everything is a NEW). But if the view query failed AND the fallback search also returned nothing, abort writeback and surface the failure in chat — don't "best-effort create" rows that might duplicate something the lookup missed.
+If the query fails, abort before any writeback — acting on a partial map would create duplicate issues.
 
 # Step 2 — Determine the window
 
-Window start = the most recent `Run date` property value across all watched customers' canonical summary rows. Window end = now. If no prior summary rows, default to 24h.
+```sql
+SELECT MAX(started_at) AS window_start
+FROM runs WHERE layer = 'customer-watch' AND status = 'succeeded';
+```
 
-**Strict rules — read carefully, this has caused short-window bugs:**
-
-- Use ONLY the `Run date` property. Never use `Last edited time`, `Created time`, or any other timestamp Notion returns. Those reflect when properties were modified, not when the prior run happened.
-- If `Run date` is a date-only value (no time), treat it as midnight UTC of that date. So `Run date: 2026-05-13` means window start = `2026-05-13T00:00:00.000Z`.
-- If `Run date` is a datetime value, use it verbatim.
-- When you WRITE `Run date` at the end of each run (Step 6 writeback), always write it as a **datetime** (ISO with time component, e.g. `2026-05-14T22:15:00.000Z`) — not a date-only value. This ensures the next run can compute a precise window without falling back on other timestamps.
+Window start = that timestamp; window end = `now()`. If `window_start` is null (first ever run), default to 24 hours back. Get a precise "now" from the DB (`SELECT now()`); never round.
 
 # Step 2.5 — Top-line activity numbers
 
-For each watched customer, pull a small set of activity counts for the window. These render as a one-line strip under the customer name so the operator has context for the issue updates (e.g. "0 examples of X" means very different things if the customer had 4 conversations vs 400).
+For each watched customer, pull a small set of activity counts for the window (via `query` against prod). These render as a one-line strip under the customer name so the operator has context for the issue updates.
 
-Numbers to collect (per customer, since window start):
+Numbers to collect (per customer, since `window_start`):
 
 - **Conversations** — `Conversation.companyId = X AND createdAt >= window_start`
 - **Low-rated conversations** — same, plus `adminRating <= 2`
@@ -95,75 +95,61 @@ Numbers to collect (per customer, since window start):
 - **Tours cancelled** — same, `status IN ('ManagerCancelled', 'ProspectCancelled')`
 - **Prospects** — `Prospect.companyId = X AND createdAt >= window_start`
 
-Keep the strip short — only render the numbers that are non-zero or particularly interesting. Don't show "0 conversations · 0 prospects · 0 tours" — that's noise. If a customer is completely silent in the window, render just one phrase: "no activity in window."
+Keep the strip short — only render non-zero counts. If a customer is completely silent in the window, render just one phrase: "no activity in window."
 
 # Step 3 — Check each known issue
 
-For every per-issue row that survived the NON ISSUE filter:
+For every per-issue row that isn't `dismissed`:
 
-1. Re-run the issue's detection signal against the window. **Read the actual `Message` rows for each conversation, not just `Conversation.summary`** — summaries are generated post-hoc and often miss what actually happened. Pull messages via `Message.conversationId` joined to conversations in the window. Read both directions (AI and prospect). The detection signal stored in the row body should be evaluated against message content, not against the summary string.
+1. Re-run the issue's `detection_signal` (or, for an operator issue with no signal, `summary`) against the window. **Read the actual `ConversationMessage` rows for each conversation, not just `Conversation.summary`** — summaries are generated post-hoc and often miss what actually happened. Pull messages via `ConversationMessage.conversationId` joined to conversations in the window. Read both AI and prospect sides.
 2. Collect up to 3 example conversation/property/error IDs.
 3. Compute today's **fired** state — a per-run boolean, not a stored status:
-   - `fired = true` if signal fires at least once in the window. Email renders as **OPEN** with examples.
-   - `fired = false` if no signal in the window. Email renders as **QUIET** (display-only label — no signal this window).
+   - `fired = true` if signal fires at least once in the window. Email renders as **OPEN** (or **HIGH ALERT** if severity is high) with examples.
+   - `fired = false` if no signal in the window. Email renders as **QUIET** (display-only label — never persisted).
 
-## Stored Status — the lifecycle, not this run
+## Stored status — the lifecycle, not this run
 
-The Notion `Status` property is the issue's **lifecycle state**, not its per-run signal. Valid values match the Notion select schema:
+The DB `status` is the issue's **lifecycle state**, not its per-run signal:
 
-- **MONITORING** — probationary state. New patterns from Step 4 start here. Streak counts sightings; auto-escalates to OPEN at 3 sightings, auto-dismisses to RESOLVED after 3 consecutive clean runs. See Step 4 for full details.
-- **OPEN** — default state for a tracked issue. Stays OPEN whether or not the signal fires on any given run. Streak counts consecutive clean runs.
-- **RESOLVED** — auto-flipped after 30 consecutive clean runs from OPEN. Or auto-dismissed from MONITORING after 3 clean runs. Means we're not actively watching anymore.
-- **HIGH ALERT** — manual operator flag. Same as OPEN but: (a) always rendered in the email even on quiet runs, (b) **auto-steps-down to OPEN after 10 consecutive clean runs** (Streak preserved). Once stepped down to OPEN, it follows normal OPEN rules and will continue toward auto-resolve at Streak 30.
-- **NON ISSUE** — manual operator flag. Dropped entirely in Step 1d.
+- **`monitoring`** — probationary state. New patterns from Step 4 start here. `streak` counts sightings; auto-escalates to `open` at 3 sightings, auto-dismisses to `resolved` after 7+ days clean (see Step 4).
+- **`open`** — default state for a tracked issue. Stays `open` whether or not the signal fires on any given run. `clean_runs` counts consecutive clean runs.
+- **`resolved`** — auto-flipped after 30 consecutive clean runs from `open`. Or auto-dismissed from `monitoring`. Means we're not actively watching anymore.
+- **`severity = 'high'`** — manual operator flag (the old Notion "HIGH ALERT"). Sticky alongside `status`. Always rendered in the email even on quiet runs. **Auto-steps-down to `severity = 'medium'` after 10 consecutive clean runs** (`clean_runs` preserved). Status is independent — `severity = 'high'` can coexist with any status.
+- **`dismissed`** — manual operator flag (the old Notion "NON ISSUE"). Dropped from email entirely.
 
-## Streak counter — consecutive clean runs
+## Counter rules
 
-`Streak` = number of consecutive runs in which the signal did **not** fire. This drives the resolution countdown.
-
-- Signal fires this run → `Streak = 0`.
-- Signal absent this run → `Streak = prior Streak + 1`.
-- New issue created this run → `Streak = 0` (signal just fired).
+- Sighted this run → `streak += 1`, `clean_runs = 0`, `last_sighted = now()`.
+- Not sighted this run → `clean_runs += 1`. `streak` unchanged.
+- New issue created this run → `streak = 1`, `clean_runs = 0`.
 
 ## Auto-resolution and auto-step-down
 
-Two automatic Status transitions, evaluated in this order each run:
+Evaluated in this order each run:
 
-1. **HIGH ALERT → OPEN** (step-down). If `Status == HIGH ALERT` and signal is absent this run and `Streak >= 10` (going into this run, before incrementing), flip Status to `OPEN`. Streak preserved — don't reset. Once on OPEN, the next rule applies normally.
-2. **OPEN → RESOLVED** (auto-resolve). If `Status == OPEN` and signal is absent this run and `Streak >= 30` (going into this run, before incrementing), flip Status to `RESOLVED`.
+1. **`severity = 'high'` step-down.** If `severity = 'high'`, signal absent this run, and `clean_runs >= 10` (going into this run, before incrementing), step `severity` down to `medium`. `status` and `clean_runs` preserved.
+2. **`open` → `resolved` (auto-resolve).** If `status = 'open'`, signal absent this run, and `clean_runs >= 30`, flip `status` to `resolved`, set `resolved_at = now()`, and write a rationale to `notes`. Every resolve requires a rationale (see Hard rules).
 
-Both transitions happen automatically. Manual operator flips (HIGH ALERT, NON ISSUE) are sticky against signal-driven transitions but not against each other — operator can always override.
+Operator flips (severity high, dismissed) are sticky against signal-driven transitions but not against each other — the operator can always override by hand.
 
 ## Regression detection
 
-If prior `Status == RESOLVED` and signal fires this run, flip Status back to `OPEN` and reset Streak to 0. Render in the email with an italicized trailing note: `(regressed after {N} clean runs)`.
-
-## Rendering rules in the email
-
-- `OPEN` + fired this run → render with OPEN pill, examples below
-- `OPEN` + not fired this run → render with QUIET pill, `{Streak} runs clean · {30 - Streak} more to resolved`
-- `HIGH ALERT` + fired this run → render with ALERT pill (use OPEN styling, but pill text says "HIGH ALERT"), examples below
-- `HIGH ALERT` + not fired this run → render with HIGH ALERT muted pill, `{Streak} runs clean` (no countdown — no auto-resolution)
-- `RESOLVED` + not fired → omit from email
-- `RESOLVED` + fired this run (regression) → render with OPEN pill plus italic `(regressed after {N} clean runs)`
-- The run that flips to RESOLVED: render once in a small "Resolved this run" footer line, then disappears on subsequent runs.
+If prior `status = 'resolved'` and signal fires this run, flip `status` back to `open`, `streak = 1`, `clean_runs = 0`, `resolved_at = NULL`, and write `notes` like `"regressed after {N} clean runs"`. Render in the email with an italic trailing note: `(regressed after {N} clean runs)`.
 
 # Step 4 — Scan every conversation for new issues
 
 Read **every** conversation in the window for each watched customer, not just low-rated ones. Don't filter by `adminRating`.
 
-**Read message by message, not the summary.** The `Conversation.summary` field is generated post-hoc by another process and is often incomplete or misleading — it's fine for a quick orientation but cannot be the source of truth. For each conversation in the window, fetch its `Message` rows ordered by `id` (or `createdAt`) and read what was actually said. AI side and prospect side. Then judge.
+**Read message by message, not the summary.** `Conversation.summary` is post-hoc and unreliable. For each conversation in the window, fetch `ConversationMessage` rows (NOT `Message` — that's a different unrelated table) ordered by `id`. Read AI side and prospect side. Then judge.
 
-The window is short — a single instance of something wrong is enough to flag.
-
-For each conversation, ask: **does this show the AI doing something obviously wrong?** Examples of "obviously wrong":
+For each conversation, ask: **does the AI do something obviously wrong?** Examples:
 
 - AI quoted a price that doesn't match listing data
-- AI offered a property in the wrong city / way out of region
-- AI agreed to something it can't deliver (a tour at a time without availability, a unit type that doesn't exist)
+- AI offered a property in the wrong city / region
+- AI agreed to something undeliverable (a tour at a time without availability, a non-existent unit)
 - AI dropped the close-loop — confirmed nothing after a long exchange
-- AI gave clearly hallucinated information (made-up building names, fabricated policies)
-- AI handed off to a human when it shouldn't have, or *didn't* hand off when it should have
+- AI hallucinated information (made-up buildings, fabricated policies)
+- AI handed off to a human when it shouldn't have, or didn't when it should have
 - AI repeated itself / got stuck in a loop
 - Tour booking failed silently
 - Stale availability quoted from prior context
@@ -174,40 +160,77 @@ Also still look at:
 - Integration error spikes by `xPropertyId`
 - Funnel/appointment anomalies you'd notice without being told to look
 
-**Single instance is enough.** Don't require 2+ matches. The window is too short for that threshold. If you see one weird thing, flag it — it'll go to MONITORING (see below) and escalate naturally if it repeats.
+**Single instance is enough.** Don't require 2+ matches. The window is too short for that threshold.
 
 For each flagged item:
 
-- Write a one-sentence description of what's wrong (from customer's perspective)
-- Note the conv ID (1 is fine; 2-3 if multiple matched)
-- Form a stable kebab-case slug (e.g. `wrong-city-cross-sell`, `quoted-price-mismatch`)
+- Form a stable kebab-case `kind` (e.g. `wrong-city-cross-sell`, `quoted-price-mismatch`)
+- Write a one-sentence `summary` (customer's perspective)
+- Write a mechanical `detection_signal` referencing message content
+- Note 1+ example conv IDs
 
-These become new per-issue rows in Step 6 with **Status = MONITORING**.
+**Match-against-existing first.** Before creating a new row, check whether the `(company_id, kind)` already exists in the Step 1 map (any status, including `dismissed`). If yes, do not create — it's a sighting of the existing issue (skip if `dismissed`). New rows are only created when nothing matches at all.
 
-## The MONITORING status
+These become new `cs_issues` rows in Step 6 with `status = 'monitoring'`, `severity = 'medium'`, `origin = 'customer-watch'`.
 
-`MONITORING` is a probationary state for issues that haven't earned full tracking yet. A new flag enters as MONITORING; if it shows up again on subsequent runs, it escalates. If it doesn't, it gets dismissed quietly.
+## `monitoring` semantics
 
-You need to add `MONITORING` to the Notion `Status` Select options — same place you added the others. Once that's done:
+`monitoring` is a probationary state for issues that haven't earned full tracking yet.
 
-**Streak semantics for MONITORING** (different from OPEN/RESOLVED/HIGH ALERT):
+- **Auto-escalation:** when a `monitoring` issue is sighted this run and `streak >= 3` (going into the increment), flip `status` to `open`, reset `streak = 0` and `clean_runs = 0`. Write `notes` like `"promoted monitoring -> open at streak 3"`.
+- **Auto-dismissal:** a `monitoring` issue auto-resolves only when BOTH hold: `first_sighted` is more than 7 days ago AND `last_sighted` is more than 7 days ago (no sighting in a 7+ day window). If first sighted less than 7 days ago, leave it `monitoring` regardless of clean-run count. Every auto-resolve must record a rationale in `notes`.
 
-- For MONITORING rows, `Streak` counts **sightings** — number of consecutive runs the signal has appeared.
-- First time detected: Streak = 1.
-- Same pattern detected again next run: Streak = 2. Etc.
-- A run where the signal does NOT appear: Streak stays the same (don't increment), but increment a separate count of "clean runs since last sighting" tracked in `Notes` (e.g. `"sighting 2, 1 clean since"`).
+# Step 4.5 — Detect CS action items
 
-**Auto-escalation: MONITORING → OPEN**
+This step is the operator's recovery queue: specific conversations where a human should reach out **right now** to smooth things over before the customer hears about it. Distinct from Step 3/4 (recurring patterns) — these are one-shot recoveries on individual prospects.
 
-When a MONITORING issue is sighted on this run and Streak >= 3 (so this is the 3rd sighting), flip Status to `OPEN` on this run. Reset Streak to 0 (now counts clean runs per the OPEN rule).
+## Load already-known actions
 
-**Auto-dismissal: MONITORING → RESOLVED**
+```sql
+SELECT * FROM v_cs_actions
+WHERE company_admin_id IN (22, 57, 76)
+  AND status = 'open';
+```
 
-A MONITORING issue may auto-dismiss to RESOLVED only when BOTH hold: (a) at least **7 days since first sighting** (use Notion `Created time`), AND (b) no sightings in that 7+ day window. If the row is less than 7 days old, leave it MONITORING regardless of how many clean runs have stacked — we don't expect issues to fire every run, so 3 clean runs alone isn't enough signal. Every RESOLVED write must include a rationale — see Hard rules.
+These are items flagged on prior runs that the operator hasn't yet marked `resolved` or `dismissed`. Keep them in mind so this run doesn't double-insert.
 
-**Manual operator action:**
+## What counts as an action item
 
-Operator can flip MONITORING → HIGH ALERT directly in Notion to skip the probation and prioritize immediately. Same rules as a regular HIGH ALERT from then on.
+Scan the same window as Steps 3 and 4. For each conversation, ask: **is there a clear, immediate action the operator should take on this prospect, off-thread or in-thread, before this customer notices?** Examples:
+
+- **`failed-booking`** — a tour booking errored, was cancelled by the manager, or the prospect got a "no slot available" reply for something they explicitly asked for. Operator should call the prospect and rebook.
+- **`dropped-thread`** — prospect asked a clear question or requested action, AI's last reply doesn't address it, prospect went silent or said "are you still there?". Conversation is recent (last message <48h ago) and the prospect is real (has a name, has multiple messages).
+- **`ai-confusion`** — AI agreed to something undeliverable (wrong unit type, time outside availability, policy the customer doesn't honor), the prospect either noticed and pushed back OR is about to find out. Operator should reach out before the prospect arrives / calls the office.
+- **`unanswered-question`** — prospect asked a specific concrete question (price, availability for a date, application status, pet policy on a specific unit) and the AI hung on a generic non-answer. Prospect's last message is on the table.
+- **`frustrated-prospect`** — prospect explicitly said they were frustrated, wanted a human, said "this isn't working", or used profanity at the AI. Hand-off didn't happen.
+- **`tour-no-show`** — `Appointment.status = 'NoShow'` in the window with no follow-up message from the manager or AI.
+- **`wrong-bedroom-or-unit`** — AI sent a tour reminder / confirmation with the wrong unit, wrong bedroom count, or wrong building. Prospect will arrive at the wrong place.
+
+This list is illustrative, not closed. The judgment is: **if the operator saw this conversation, would they pick up the phone?** If yes, flag it. If it's just a system-pattern observation (better tracked in `cs_issues`), don't.
+
+## Single-instance rule
+
+One conversation, one action item per `action_kind`. If a single conversation has both a failed booking and a frustrated prospect, that's two action items (two `action_kind` values). The `(conversation_id, action_kind)` unique constraint enforces this.
+
+## Match against open items first
+
+For each candidate action, check whether `(conversation_id, action_kind)` is already in the open-actions map. If yes, it's a re-flag — bump `last_flagged = now()`, leave everything else alone. Don't insert a duplicate.
+
+## Auto-resolve heuristics
+
+For each `open` action loaded above, check whether the situation has resolved itself in the underlying data. If yes, this skill flips it to `resolved` automatically.
+
+- **`dropped-thread`** — if the conversation has had at least one AI or manager-sent message after `first_flagged` AND the prospect has replied to it (or at least the manager has joined), auto-resolve.
+- **`unanswered-question`** — same heuristic: if a substantive reply has been sent after `first_flagged`, auto-resolve.
+- **`failed-booking`** — if a new `Appointment` row exists for the same prospect with `status IN ('Confirmed','ManagerConfirmed','Completed')` and `createdAt > first_flagged`, auto-resolve (the booking was redone).
+- **`tour-no-show`** — if a follow-up message (manager- or AI-sent) was logged after `first_flagged`, auto-resolve.
+- **`ai-confusion` / `wrong-bedroom-or-unit` / `frustrated-prospect`** — no reliable auto-resolve heuristic. Stay `open` until the operator marks them by hand.
+
+Every auto-resolve writes a `notes` rationale. Items the operator manually marked `dismissed` are terminal — never re-flag the same `(conversation_id, action_kind)`.
+
+## Aging-out
+
+An `open` action whose `first_flagged > 14 days ago` is no longer "right now" actionable. Flip it to `dismissed` with `notes = 'aged out — stale for 14+ days'`. Don't render it in the email any further.
 
 # Step 5 — Email
 
@@ -217,7 +240,21 @@ Short HTML. Should scan on a phone in under 30 seconds. Mobile email clients are
 
 `Customer watch — {N} customers — YYYY-MM-DD HH:MM`
 
-Use timestamp because runs can happen multiple times a day.
+Use a timestamp because runs can happen multiple times a day.
+
+## Pill mapping
+
+The DB stores `status` + `severity` separately; the email shows the familiar single pill. Map:
+
+| Stored | Pill displayed |
+|---|---|
+| `severity = 'high'` (any active status) | **HIGH ALERT** |
+| `status = 'open'` + sighted this run | **OPEN** (firing) |
+| `status = 'open'` + not sighted | **QUIET** (display-only label, never persisted) |
+| `status = 'monitoring'` + sighted | **MONITORING** (sighting) |
+| `status = 'monitoring'` + not sighted | **MONITORING** (muted) |
+| `status = 'resolved'` + not sighted | omitted entirely |
+| `status = 'resolved'` + sighted (regression) | **OPEN** with italic regression note |
 
 ## HTML structure
 
@@ -258,15 +295,15 @@ Wrap the body in a centered container with max-width so it doesn't stretch on de
       <span style="color:#3d3b35;">30d ratio still 0.500 (11 ManagerCancelled / 11 ManagerConfirmed / 0 Completed).</span>
     </p>
 
-    <!-- OPEN issue (no fire this run): muted, sub-tag says clean run, streak + countdown -->
+    <!-- OPEN, no fire this run: muted, sub-tag says clean run, clean_runs + countdown -->
     <p style="margin:0 0 8px;font-size:13px;color:#807548;">
       <span style="font-family:ui-monospace,SFMono-Regular,Menlo,monospace;">date-confusion-on-tour-booking</span>
-      <span style="display:inline-block;margin-left:6px;padding:2px 8px;font-size:10px;letter-spacing:0.04em;background:#ede8d8;color:#807548;border-radius:999px;font-weight:600;">OPEN</span>
+      <span style="display:inline-block;margin-left:6px;padding:2px 8px;font-size:10px;letter-spacing:0.04em;background:#ede8d8;color:#807548;border-radius:999px;font-weight:600;">QUIET</span>
       <span style="margin-left:6px;font-size:11px;color:#807548;font-style:italic;">clean run</span>
       <span style="margin-left:8px;font-size:12px;">12 runs clean · 18 more to resolved</span>
     </p>
 
-    <!-- HIGH ALERT firing this run -->
+    <!-- HIGH ALERT firing this run (severity='high' + sighted) -->
     <p style="margin:0 0 12px;font-size:14px;">
       <span style="font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:13px;color:#b54a3a;">tentative-booking-language-confusing</span>
       <span style="display:inline-block;margin-left:6px;padding:2px 8px;font-size:10px;letter-spacing:0.04em;background:#b54a3a;color:#fff;border-radius:999px;font-weight:600;">HIGH ALERT</span>
@@ -280,21 +317,41 @@ Wrap the body in a centered container with max-width so it doesn't stretch on de
       <span style="font-family:ui-monospace,SFMono-Regular,Menlo,monospace;">leads-not-received</span>
       <span style="display:inline-block;margin-left:6px;padding:2px 8px;font-size:10px;letter-spacing:0.04em;background:#fbe5dc;color:#b54a3a;border-radius:999px;font-weight:600;">HIGH ALERT</span>
       <span style="margin-left:6px;font-size:11px;color:#b54a3a;font-style:italic;">clean run</span>
-      <span style="margin-left:8px;font-size:12px;">8 runs clean · 2 more before step-down to OPEN</span>
+      <span style="margin-left:8px;font-size:12px;">8 runs clean · 2 more before step-down</span>
     </p>
 
-    <h3 style="font-size:11px;letter-spacing:0.08em;text-transform:uppercase;color:#807548;font-weight:600;margin:24px 0 10px;">New patterns noticed</h3>
-
+    <!-- MONITORING (probationary) firing this run -->
     <p style="margin:0 0 12px;font-size:14px;">
-      <span style="font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:13px;color:#8a4a30;">riverside-no-langley-inventory</span>
-      <span style="display:inline-block;margin-left:6px;padding:2px 8px;font-size:10px;letter-spacing:0.04em;background:#fbf3ed;color:#cc785c;border-radius:999px;font-weight:600;">NEW</span>
+      <span style="font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:13px;color:#7a5d1c;">riverside-no-langley-inventory</span>
+      <span style="display:inline-block;margin-left:6px;padding:2px 8px;font-size:10px;letter-spacing:0.04em;background:#f4e5c4;color:#7a5d1c;border-radius:999px;font-weight:600;">MONITORING</span>
+      <span style="margin-left:6px;font-size:11px;color:#7a5d1c;font-style:italic;">sighting 2/3</span>
       <br/>
-      <span style="color:#3d3b35;">Sara at Riverside Gardens Langley requested a 3-bed, AI tried intra-region cross-sell but no Langley/Aldergrove inventory matched. Single conv 8243 — keep watching.</span>
+      <span style="color:#3d3b35;">Sara at Riverside Gardens Langley requested a 3-bed, AI tried intra-region cross-sell but no Langley/Aldergrove inventory matched. Conv 8243.</span>
     </p>
 
-    <!-- Resolved-this-run footer, only if any flipped to RESOLVED on this run -->
+    <h3 style="font-size:11px;letter-spacing:0.08em;text-transform:uppercase;color:#807548;font-weight:600;margin:24px 0 10px;">Needs follow-up</h3>
+
+    <!-- New action this run -->
+    <p style="margin:0 0 12px;font-size:14px;">
+      <span style="font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:13px;color:#8c3527;">failed-booking</span>
+      <span style="display:inline-block;margin-left:6px;padding:2px 8px;font-size:10px;letter-spacing:0.04em;background:#ecc8c0;color:#8c3527;border-radius:999px;font-weight:600;">ACTION</span>
+      <span style="margin-left:6px;font-size:11px;color:#8c3527;font-style:italic;">new this run</span>
+      <br/>
+      <span style="color:#3d3b35;">Conv <a href="https://www.rentsimple.ai/admin/conversations?conversationId=8341" style="color:#8a4a30;">#8341</a> — Jordan booked a 4pm tour at Foothills Crossing, manager cancelled, AI replied "let me know if you'd like to reschedule" and Jordan went silent. Call and rebook.</span>
+    </p>
+
+    <!-- Carried over from prior run, still open -->
+    <p style="margin:0 0 12px;font-size:14px;">
+      <span style="font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:13px;color:#8a4a30;">dropped-thread</span>
+      <span style="display:inline-block;margin-left:6px;padding:2px 8px;font-size:10px;letter-spacing:0.04em;background:#f0d9cc;color:#8a4a30;border-radius:999px;font-weight:600;">ACTION</span>
+      <span style="margin-left:6px;font-size:11px;color:#8a4a30;font-style:italic;">open 2 runs · flagged 18h ago</span>
+      <br/>
+      <span style="color:#3d3b35;">Conv <a href="https://www.rentsimple.ai/admin/conversations?conversationId=8302" style="color:#8a4a30;">#8302</a> — Sara asked twice about the $200 deposit on unit 4B, AI talked about pet policy instead. She hasn't replied since Tuesday.</span>
+    </p>
+
+    <!-- Resolved-this-run footer, only if any flipped to resolved on this run -->
     <p style="margin:16px 0 0;font-size:12px;color:#807548;font-style:italic;">
-      Resolved this run: <span style="font-family:ui-monospace,SFMono-Regular,Menlo,monospace;">virtual-tours-disabled-flag</span> (30 clean runs).
+      Resolved this run: <span style="font-family:ui-monospace,SFMono-Regular,Menlo,monospace;">virtual-tours-disabled-flag</span> (30 clean runs); action <span style="font-family:ui-monospace,SFMono-Regular,Menlo,monospace;">unanswered-question</span> on conv #8270 (prospect replied after follow-up).
     </p>
 
     <!-- Scan footer — always present, confirms Step 4 ran -->
@@ -310,69 +367,60 @@ Wrap the body in a centered container with max-width so it doesn't stretch on de
 
 - Render under the customer name, before the Known issues heading.
 - Bullet separator (`·`) between counts. Whitespace around it.
-- Omit any count that is zero or trivially small (e.g. "0 cancelled" — drop it).
-- If the customer had no activity at all, replace the strip with a single muted phrase: `no activity in window`.
-- Strip is one line, 12px, olive `#807548`. Visually quieter than headings.
+- Omit any count that is zero or trivially small.
+- If the customer had no activity at all, replace the strip with `no activity in window`.
+- Strip is one line, 12px, olive `#807548`.
 
 **Sub-tag (small italic, immediately after the status pill):**
 
-Every issue line gets a small italicised sub-tag that tells the operator at a glance what happened *this run*, separate from the long-running Status pill:
+Every issue line gets a small italicised sub-tag for what happened *this run*, separate from the long-running status pill:
 
-- **`{N} caught`** — issue fired this run with N discrete instances (conv IDs / property IDs / error events). Use the count of distinct example IDs you'd cite below.
-- **`firing`** — issue fired this run via a state-based signal (e.g. a ratio over a 30d rolling window, a count threshold). No discrete instance count makes sense.
-- **`clean run`** — signal did NOT fire this run. Streak increments. Followed by the long-running streak + countdown text.
+- **`{N} caught`** — issue fired this run with N discrete instances. Use the count of distinct example IDs.
+- **`firing`** — issue fired via a state-based signal (ratio, threshold). No discrete instance count makes sense.
+- **`clean run`** — signal did NOT fire this run. Followed by the long-running countdown text.
+- **`sighting {Streak}/3`** — monitoring row sighted this run.
+- **`no sighting`** — monitoring row not sighted this run.
 
-Sub-tag colour matches the pill text colour. 11px italic. Sits between the pill and the streak/countdown text (or between the pill and the line break before examples).
+Sub-tag colour matches the pill text colour. 11px italic.
 
-**Pill selection (driven by Status + fired-this-run):**
+**Pill / detail-line table (driven by status + severity + fired):**
 
-| Stored Status | Fired this run? | Pill | Detail line |
-|---|---|---|---|
-| MONITORING | yes | MONITORING (amber `#f4e5c4` bg, `#7a5d1c` text) | examples on next line + `sighting {Streak}/3` |
-| MONITORING | no | MONITORING muted (beige `#f0e9d8` bg, `#9a8a5a` text) | `no sighting · {3 - clean} more clean runs to dismiss` |
-| OPEN | yes | OPEN (peach `#f0d9cc`) | examples on next line |
-| OPEN | no | QUIET (beige `#ede8d8`) | `{Streak} runs clean · {30 - Streak} more to resolved` |
-| HIGH ALERT | yes | HIGH ALERT (solid `#b54a3a` bg, white text) | examples on next line |
-| HIGH ALERT | no | HIGH ALERT muted (`#fbe5dc` bg, `#b54a3a` text) | `{Streak} runs clean · {10 - Streak} more before step-down to OPEN` |
-| RESOLVED | no | omitted from email entirely | — |
-| RESOLVED | yes (regression) | OPEN with italic regression note | examples + `(regressed after {N} clean runs)` |
+| status | severity | fired | Pill | Detail line |
+|---|---|---|---|---|
+| monitoring | medium | yes | MONITORING (`#f4e5c4` bg, `#7a5d1c` text) | examples on next line + `sighting {streak}/3` |
+| monitoring | medium | no | MONITORING muted (`#f0e9d8` bg, `#9a8a5a` text) | `no sighting · {days remaining} to dismissal` |
+| open | medium | yes | OPEN (`#f0d9cc` bg, `#8a4a30` text) | examples on next line |
+| open | medium | no | QUIET (`#ede8d8` bg, `#807548` text) | `{clean_runs} runs clean · {30 - clean_runs} more to resolved` |
+| any active | high | yes | HIGH ALERT (`#b54a3a` bg, white text) | examples on next line |
+| any active | high | no | HIGH ALERT muted (`#fbe5dc` bg, `#b54a3a` text) | `{clean_runs} runs clean · {10 - clean_runs} more before step-down` |
+| resolved | any | no | omitted entirely | — |
+| resolved | any | yes (regression) | OPEN with italic regression note | examples + `(regressed after {N} clean runs)` |
 
-**MONITORING rendering:** Render in the **same section as known issues** (not under "New patterns noticed" anymore — that section is gone). The amber pill visually distinguishes probationary issues from established OPEN ones. On the run where Streak hits 3 and it auto-escalates to OPEN, render it once with both transition info — `MONITORING → OPEN (3rd sighting, now tracking)` — then it appears as a normal OPEN issue going forward.
-
-**Auto-resolution transition:**
-
-If `Status == OPEN` and `Streak >= 30` going into this run and signal is absent → flip to RESOLVED. Do NOT render in the Known issues section. Render once in the "Resolved this run" footer (one-shot visibility), then disappear from future emails.
+**Auto-resolution transition:** if `status = 'open'`, `clean_runs >= 30`, and signal absent → flip to `resolved`. Do NOT render in the Known issues section. Render once in the "Resolved this run" footer (one-shot), then disappear from future emails.
 
 **Resolved-this-run footer:**
 
-- Only render if at least one issue flipped to RESOLVED on this run.
+- Only render if at least one issue flipped to `resolved` on this run.
 - Small italic muted text. Lists the slugs with their final clean-run count.
-- Issues already RESOLVED on prior runs do not appear here — they're invisible until they regress.
+- Issues already `resolved` on prior runs do not appear here — they're invisible until they regress.
 
 **Scan footer — always render, one short italic line per customer:**
 
-Confirms Step 4 actually ran, even when nothing new came out of it. Reassures the operator the scan wasn't skipped.
+Confirms Step 4 actually ran, even when nothing new came out of it.
 
-- If new patterns *were* found: a brief reference like `"Also flagged 1 new pattern above."` (no need to list them again — they're already in the New patterns block).
+- If new patterns *were* found: `"Also flagged 1 new pattern above."` (no need to list them again — they're already in the Known issues block as `MONITORING`).
 - If nothing new: vary the phrasing slightly so it doesn't read like a robotic boilerplate line every run. Examples:
   - "Scanned the remaining conversations — nothing else worth flagging."
   - "Rest of the window looked normal."
   - "Reviewed the other N conversations — no new patterns."
   - "Nothing else stood out in the scan."
-- Use the actual conversation count from the activity strip when it adds context (e.g. "Reviewed the other 6 conversations — clean").
+- Use the actual conversation count from the activity strip when it adds context.
 - Same styling as Resolved footer: 12px italic, olive `#807548`.
 - Render even when the customer had no activity in the window — in that case: `"No conversations in window — nothing to scan."`
 
-**Status writes — schema enforcement:**
-
-The Notion `Status` Select schema accepts only: `OPEN`, `RESOLVED`, `NON ISSUE`, `HIGH ALERT`. Never write any other value. `QUIET` is a display label only — never persisted to the Status property. If you find yourself wanting to write a status not in this list, that's a bug — skip the write and surface in chat report-back.
-
 **Tag rules:**
 
-- `OPEN` pill — peach background `#f0d9cc`, text `#8a4a30`. Issue slug rendered in the same brown color so the eye groups them.
-- `QUIET` pill — beige background `#ede8d8`, text `#807548`. Whole row uses that muted color and slightly smaller font so it visually recedes.
-- `NEW` pill (new patterns only) — light peach background `#fbf3ed`, text `#cc785c`. Same brown slug color as OPEN — these need attention.
-- Issue slug is always monospace, never bold.
+- Issue `kind` rendered in monospace, never bold.
 - No `<b>`, no `<strong>`, no underlines anywhere in the body.
 
 **Layout rules:**
@@ -380,98 +428,149 @@ The Notion `Status` Select schema accepts only: `OPEN`, `RESOLVED`, `NON ISSUE`,
 - One blank-line gap between issues (12px margin), wider gap before a new section heading (24px).
 - Each customer separated by a thin top border (`#e3decf`) and 32px bottom margin.
 - Opening line is greyer (`#3d3b35`) and smaller — sets tone without competing.
-- Section headings are small uppercase olive (`#807548`) — quiet but clearly delimit sections.
+- Section headings are small uppercase olive (`#807548`).
 - Customer name in Georgia serif — the one place a different font is used, to anchor the section.
 
 **Conditional rendering:**
 
-- If a customer has no new patterns, omit the `New patterns noticed` heading entirely.
-- If all known issues are QUIET and no new patterns, render only the customer name and one muted line: `<p style="margin:0;font-size:13px;color:#807548;">Nothing firing this run.</p>`
-- If all watched customers are quiet, the whole body is the opening line + one customer block each saying "Nothing firing this run." Don't skip customers entirely — operator needs to know they were checked.
+- If a customer has no `open` action items (and none surfaced this run), omit the `Needs follow-up` heading entirely.
+- If all known issues are QUIET / muted, no new patterns, AND no action items, render only the customer name and one muted line: `<p style="margin:0;font-size:13px;color:#807548;">Nothing firing this run.</p>`
+- If all watched customers are quiet, the whole body is the opening line + one customer block each saying "Nothing firing this run." Don't skip customers entirely — the operator needs to know they were checked.
+
+**Action-section ordering:**
+
+Render `Needs follow-up` *after* `Known issues`. Within the section, sort by: new-this-run first, then carried-over (open from prior runs) by `first_flagged` desc (oldest at the bottom so the freshest items lead). HIGH-stakes kinds (`failed-booking`, `wrong-bedroom-or-unit`, `frustrated-prospect`) get the solid `#ecc8c0` / `#8c3527` ACTION pill; the rest get the lighter `#f0d9cc` / `#8a4a30` ACTION pill.
+
+**Action sub-tag:**
+
+- **`new this run`** — `first_flagged = now`. Solid pill if a high-stakes kind, otherwise standard.
+- **`open N runs · flagged Xh ago`** — carried over. `N` = how many runs since `first_flagged` (count `customer-watch` runs in the window between then and now). `Xh` is wall-clock age — hours up to 48h, days after that.
 
 **Hard rules for the email:**
 
-- Never describe what the skill is doing internally. No "creating a new row this run", no "flipping the canonical", no "archive-dup cleanup", no mention of Notion bookkeeping at all.
+- Never describe what the skill is doing internally. No mention of `cs_issues`, `state_query`, no DB bookkeeping.
 - Never propose fixes, file tickets, or recommend next steps. This skill reports; it doesn't direct.
 - No PII. Conversation IDs only. No customer staff names if you can avoid it, though first names attached to a conv ID are OK ("Olivia, Panorama→Foothills").
-- No emojis. No bold-text headings inside paragraphs except the issue slug at the start.
+- No emojis. No bold-text headings inside paragraphs except the issue `kind` at the start.
 
-# Step 6 — Notion writeback
+# Step 6 — Writeback
 
-Upsert by exact Name. Never create duplicates.
+All writes go through `state_query`. Order: upsert companies, then upsert issues, then close the run.
 
-For each known per-issue row + each new pattern from Step 4 + the summary row per customer:
+## 6a. Upsert companies
 
-1. Look up the page_id in the Step 1 map using the exact Name string.
-2. **If page_id exists:** `notion-update-page` with `command: update_properties` — overwrite Status (one of `OPEN`/`RESOLVED`/`HIGH ALERT`/`NON ISSUE` per Step 3 transitions; never paraphrase), Run date (now), Sample Convs (today's examples if signal fired, else empty), Streak (clean-run count from Step 3), Notes (one short line). Body stays intact.
-3. **If no page_id in the map** (new pattern only): `notion-create-pages` with parent `{"type": "data_source_id", "data_source_id": "35f9fe3f-af42-80ba-bf81-000b602adf12"}` and the body template below.
+For every watched company resolved in Step 1, ensure the `companies` row exists. `admin_id` is the prod `Company.id`; `slug` is a kebab-case handle of the name:
 
-**Hard rules against duplicates:**
-
-- Never call `notion-create-pages` for a Name that exists as an exact-title key in the Step 1 map.
-- Never call `notion-create-pages` because a search "didn't return" something — only because the Step 1 map genuinely has no entry for that exact Name.
-- If Step 1 surfaced multiple rows for the same Name, do NOT create another. Update the canonical, leave the dupes for manual cleanup.
-- The Name string for create must match the slug pattern exactly: `cs-{company-slug}` or `cs-{company-slug}-{issue-slug}`. No suffixes, no timestamps.
-
-## Properties
-
-Both row types:
-
-- **Run date** (date): now, ISO
-- **Companies** (text): customer name
-- **Companies count** (number): 1
-- **Type** (select): `Customer`
-
-Summary row (`cs-{slug}`):
-
-- **Name** (title): `cs-{company-slug}`
-- **Status** (select): always `OPEN` (the summary represents an actively-watched customer)
-- **Sample Convs** (text): up to 3 conv IDs from today
-- **Streak** (number): total runs this customer has been watched (prior + 1)
-- **Notes** (text): one short line — e.g. "2 of 4 known issues fired; 1 new pattern noticed"
-
-Per-issue row (`cs-{slug}-{issue-slug}`):
-
-- **Name** (title): `cs-{company-slug}-{issue-slug}`, stable across runs
-- **Status** (select): from Step 3 — `OPEN`, `RESOLVED`, `HIGH ALERT`, or `NON ISSUE`. Never `QUIET` (that's display-only).
-- **Sample Convs** (text): up to 3 example IDs from this run if signal fired; empty otherwise
-- **Streak** (number): consecutive runs in which the signal did NOT fire (the clean-run counter from Step 3). Reset to 0 on a run where the signal fires.
-- **Notes** (text): one short line — e.g. "fired: 2 examples", "clean run 12/30", "stepped down from HIGH ALERT"
-
-## New per-issue body template
-
-```markdown
-**Issue:** <one sentence — what's going wrong from customer's perspective>
-
-**Detection signal:** <mechanical — describe the pattern in terms of message content (what the AI said, what the prospect said), property/building involvement, error codes, or state metrics. NEVER write a detection signal that depends on `Conversation.summary` — summaries are unreliable. Future runs will read message rows and judge against this signal.>
-
-**Examples on first detection:**
-
-- {conv_id} — {one-line context}
-- {conv_id} — {one-line context}
+```sql
+INSERT INTO companies (slug, name, admin_id)
+VALUES ('briarlane', 'Briarlane', 76)
+ON CONFLICT (slug) DO UPDATE
+  SET name = excluded.name, admin_id = excluded.admin_id;
 ```
 
-Detection signals must be mechanical AND must reference message content (not summaries). Good: `"AI message body contains a price quote AND the prospect's listing's published price differs by >$200"`, or `"Any message where AI references a property in a different region from the prospect's inquired property"`. Bad: `"prospects complain about Williams pricing"` (too fuzzy), `LOWER(c.summary) LIKE '%williams%'` (depends on unreliable summary).
+## 6b. New issues (Step 4 new patterns)
 
-If a writeback call fails, retry once. If still failing, include the failed payload in chat report-back; don't abort the run.
+For each new pattern, insert it as `monitoring`. Resolve `company_id` from the slug in the same statement:
+
+```sql
+INSERT INTO cs_issues (company_id, kind, status, severity, streak, clean_runs,
+                       summary, detection_signal, sample_convs, first_sighted, last_sighted)
+SELECT c.id, 'wrong-city-cross-sell', 'monitoring', 'medium', 1, 0,
+       'AI offered a property in a different region from the prospect''s inquired property.',
+       'Any AI message where the listing referenced is in a different region from the prospect''s inquired property.',
+       '["8243"]'::jsonb, now(), now()
+FROM companies c WHERE c.slug = 'riverside-langley'
+ON CONFLICT (company_id, kind) DO UPDATE
+  SET streak = cs_issues.streak + 1, clean_runs = 0, last_sighted = now(),
+      sample_convs = excluded.sample_convs
+  WHERE cs_issues.status <> 'dismissed';
+```
+
+`summary` and `detection_signal` are written once and **never rewritten** on later runs. The `WHERE cs_issues.status <> 'dismissed'` guard ensures a re-detected pattern can never silently reopen an issue the operator dismissed. New patterns insert with the default `origin = 'customer-watch'` — never set `origin` yourself.
+
+## 6c. Existing issues
+
+For each known issue, apply the Step 3 transition by `id`:
+
+```sql
+UPDATE cs_issues
+SET status = 'open', severity = 'medium', streak = 4, clean_runs = 0,
+    last_sighted = now(), sample_convs = '["8224","8083"]'::jsonb,
+    notes = 'sighted this run; 2 examples'
+WHERE id = 42;
+```
+
+For an auto-resolve, also set `resolved_at = now()` and a `notes` rationale (trigger rule, first/last-sighted dates, days clean). For a regression, set `resolved_at = NULL`, `status = 'open'`, `streak = 1`, `clean_runs = 0`, and a `notes` rationale.
+
+- Update only the rows that changed this run. An untouched issue (not sighted, no transition) still needs `clean_runs += 1` — apply that.
+- **`kind`, `summary`, `detection_signal` are stable** — never rewrite them once set.
+- Do not set `updated_at` — the DB trigger maintains it.
+
+## 6d. CS actions
+
+For each new action item from Step 4.5, insert. For each existing `open` item that was re-flagged this run, bump `last_flagged`. For auto-resolves and age-outs, update the row.
+
+```sql
+-- New action this run
+INSERT INTO cs_actions (company_id, conversation_id, action_kind, summary, sample_evidence)
+SELECT c.id, 8341, 'failed-booking',
+       'Jordan booked a 4pm tour at Foothills Crossing, manager cancelled, AI offered to reschedule and Jordan went silent.',
+       '[{"message_id":91204},{"appointment_id":2218}]'::jsonb
+FROM companies c WHERE c.slug = 'foothills-crossing'
+ON CONFLICT (conversation_id, action_kind) DO UPDATE
+  SET last_flagged = now()
+  WHERE cs_actions.status = 'open';
+
+-- Auto-resolve
+UPDATE cs_actions
+SET status = 'resolved', resolved_at = now(),
+    notes = 'auto-resolved — manager replied at 2026-05-24T18:02Z, prospect replied at 2026-05-24T19:11Z'
+WHERE id = 88;
+
+-- Age-out
+UPDATE cs_actions
+SET status = 'dismissed',
+    notes = 'aged out — stale for 14+ days, first_flagged 2026-05-09'
+WHERE id = 73;
+```
+
+`summary` and `action_kind` are stable on insert — never rewrite them on later runs. `notes` is the operator-owned field except when this skill writes a transition rationale; never overwrite an operator-set `notes`.
+
+## 6e. Close the run
+
+```sql
+UPDATE runs
+SET status = 'succeeded', finished_at = now(),
+    summary = '3 watched customers; 2 of 5 known issues fired; 1 new pattern; 2 action items.',
+    stats = '{"watched":3,"sighted":2,"new":1,"resolved":0,"processed":42,
+             "actions_new":2,"actions_open":3,"actions_resolved":1}'::jsonb
+WHERE id = <run_id>;
+```
+
+If the run failed before this point, leave the row `running` (or set it to `failed` with a summary if you can).
 
 # Hard rules
 
-- Read-only on the DB.
-- **Read message-level data, not summaries.** Every conversation check (Step 3, Step 4) must read the actual `Message` rows for each conversation in the window — both AI and prospect sides. `Conversation.summary` is a post-hoc rollup that often misses or misrepresents what actually happened. Use it only as a quick orientation hint, never as the source of truth for whether a signal fired.
+- Read-only on the prod DB (`query`). Reads and writes only to the watch-state DB (`state_query`), and only `cs_issues`, `cs_actions`, `companies`, `runs`.
+- **Read message-level data, not summaries.** Every check reads actual `ConversationMessage` rows (NOT `Message` — different table). `Conversation.summary` is unreliable; orientation hint only.
+- **Customer-watch is isolated.** This skill never touches `issues`, `clusters`, or `cluster_snapshots`. Those belong to conversation-watch / daily-pulse.
 - No PII or email-thread quotes in the email body.
 - No emojis.
 - Watched-customer list is source of truth. Don't expand or shrink it based on today's signal.
 - The skill reports. It does not propose, recommend, suggest, prioritize, file, or escalate.
-- **Every RESOLVED write requires a rationale in Notes** — trigger rule, first-sighted date, last-sighted date, days clean. Example: `RESOLVED — MONITORING auto-dismissal. First sighted 2026-05-01, last sighted 2026-05-02, 13 days clean.` If you can't construct one (e.g. row <7 days old, last-sighted unknown), do NOT flip to RESOLVED — leave the row in its current status.
+- `status` writes must be exactly `open`, `monitoring`, `resolved`, or `dismissed`; `severity` exactly `low`, `medium`, or `high`. The DB domains reject anything else.
+- **`detection_signal` must be mechanical** — describe the pattern in terms of message content, property/building involvement, error codes, or state metrics. NEVER reference `Conversation.summary`.
+- **Never reopen a `dismissed` issue**, and never re-insert a dismissed `(company, kind)` as new. Dismissal is the operator's call; only an operator un-dismisses.
+- **`operator_note` is operator-owned** — read it as guidance for the run, never write or clear it. **`origin` is set at creation** — never change it; new patterns this skill creates keep the default `customer-watch`.
+- **Every resolve requires a rationale in `notes`** — trigger rule, first-sighted date, last-sighted date, days clean. If you can't construct one (e.g. monitoring row first sighted <7 days ago), do NOT resolve — leave the issue in its current status.
 
 # Chat report-back
 
-Short, free-form. Cover:
+Short, free-form. One line each:
 
-- Watched customers (names + IDs)
+- Watched customers (names + admin IDs)
 - Email sent to (recipients)
-- Notion rows written (rough count: N updated + M created)
-- NON ISSUE suppressions if any
-- **Duplicate rows detected** in Notion (Name → count) for manual cleanup
-- Anything weird worth flagging (Notion lookup failed, writeback retry needed, etc.)
+- `cs_issues` rows written (rough count: N updated + M created)
+- `cs_actions` this run: K new · J open carried · R auto-resolved · D aged out
+- `dismissed` suppressions if any
+- Anything weird worth flagging (state_query write failures, domain rejections, prod query slowness, etc.)
