@@ -47,6 +47,22 @@ function ageDays(value) {
   return d <= 0 ? "today" : `${d}d`;
 }
 
+// Relative age in the granularity that's actually useful at a glance — minutes
+// under an hour, hours under a day, then days. Empty string returns em-dash.
+function timeAgo(value) {
+  if (!value) return "—";
+  const ms = Date.now() - new Date(value).getTime();
+  if (ms < 0) return "just now";
+  const min = Math.floor(ms / 60000);
+  if (min < 1) return "just now";
+  if (min < 60) return `${min}m ago`;
+  const hr = Math.floor(min / 60);
+  if (hr < 24) return `${hr}h ago`;
+  const d = Math.floor(hr / 24);
+  if (d < 30) return `${d}d ago`;
+  return `${Math.floor(d / 30)}mo ago`;
+}
+
 // Build an internal URL carrying the auth token.
 export function href(token, path, params = {}) {
   const q = new URLSearchParams();
@@ -660,6 +676,13 @@ export function renderCompanies({
           num(a.topline && a.topline.conversations),
       );
       break;
+    case "last_sighted":
+      sorted.sort((a, b) => {
+        const av = a.last_sighted ? new Date(a.last_sighted).getTime() : 0;
+        const bv = b.last_sighted ? new Date(b.last_sighted).getTime() : 0;
+        return bv - av; // most-recent first
+      });
+      break;
     default: // health
       sorted.sort(
         (a, b) =>
@@ -715,6 +738,9 @@ export function renderCompanies({
     const prospectsCell = num(tl.prospects)
       ? num(tl.prospects)
       : '<span class="muted">—</span>';
+    const lastSightedCell = c.last_sighted
+      ? `<span title="${esc(new Date(c.last_sighted).toISOString())}">${esc(timeAgo(c.last_sighted))}</span>`
+      : '<span class="muted">never</span>';
     return `
       <tr class="row" onclick="location='${lk("/company/" + c.slug)}'" style="cursor:pointer">
         <td><a class="name" href="${lk("/company/" + c.slug)}">${esc(c.name)}</a></td>
@@ -722,6 +748,7 @@ export function renderCompanies({
         <td>${issuesCell}</td>
         <td>${monitoringCell}</td>
         <td>${actionsCell}</td>
+        <td>${lastSightedCell}</td>
         <td>${cvCell}</td>
         <td>${toursCell}</td>
         <td>${prospectsCell}</td>
@@ -736,6 +763,7 @@ export function renderCompanies({
           ${sortHead("issues", "Open issues")}
           <th>Monitoring</th>
           ${sortHead("actions", "Actions")}
+          ${sortHead("last_sighted", "Last sighting")}
           ${sortHead("conversations", "Convs")}
           <th>Tours</th>
           <th>Prospects</th>

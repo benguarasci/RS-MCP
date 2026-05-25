@@ -285,7 +285,11 @@ async function loadCompanyAggregates() {
       (SELECT count(*)::int FROM cs_issues i WHERE i.company_id = c.id AND i.status = 'open')       AS cs_open,
       (SELECT count(*)::int FROM cs_issues i WHERE i.company_id = c.id AND i.status = 'monitoring') AS cs_monitoring,
       (SELECT count(*)::int FROM cs_issues i WHERE i.company_id = c.id AND i.status IN ('open','monitoring') AND i.severity = 'high') AS cs_high,
-      (SELECT count(*)::int FROM cs_actions a WHERE a.company_id = c.id AND a.status = 'open')      AS open_actions
+      (SELECT count(*)::int FROM cs_actions a WHERE a.company_id = c.id AND a.status = 'open')      AS open_actions,
+      GREATEST(
+        (SELECT max(last_sighted) FROM issues    i WHERE i.company_id = c.id AND i.status IN ('open','monitoring')),
+        (SELECT max(last_sighted) FROM cs_issues i WHERE i.company_id = c.id AND i.status IN ('open','monitoring'))
+      ) AS last_sighted
     FROM companies c
     ORDER BY c.name
   `);
